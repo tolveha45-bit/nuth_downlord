@@ -1,43 +1,138 @@
-# NUTHH Downloader Bot
+# NUTHH’ Downloader V2
 
-A Telegram YouTube/TikTok downloader bot with:
-
-- 🔑 License key system
-- 🎬 Video download
-- 🎵 MP3 download
-- 📥 Unlimited downloads
-- 👑 Owner panel
-- 👥 User management
-- 📢 Multiple Telegram channels
-- 💾 SQLite database
-- 🚀 Railway deployment
-
----
+A Telegram YouTube/TikTok Downloader Bot with License System.
 
 ## Features
 
-### Downloader
-
-Supported platforms:
-
-- YouTube
+- YouTube download
+- YouTube Shorts
 - TikTok
+- MP4
+- MP3
+- SQLite
+- License system
+- Multiple owners
+- User management
+- Multiple Telegram channels
+- Automatic MP3 channel posting
+- License expiration
+- Revoke
+- Restore
+- Delete
+- Statistics
+- Session-based activation
+- Railway ready
+- GitHub ready
 
-Supported download types:
+## License Durations
 
-- 🎬 Video
-- 🎵 MP3
+- 1d
+- 7d
+- 30d
+- 90d
+- 1y
+- lifetime
 
----
+## Main Owner
 
-## License System
+Telegram ID:
 
-License durations:
+8736435737
 
-```text
-1d
-7d
-30d
-90d
-1y
-lifetime
+## Environment Variables
+
+BOT_TOKEN=YOUR_NEW_BOT_TOKEN
+
+OWNER_ID=8736435737
+
+DATABASE_PATH=nuthh.db
+
+## Install
+
+pip install -r requirements.txt
+
+## Run
+
+python bot.py
+
+## Generate Key
+
+/genkey 1d
+
+/genkey 7d
+
+/genkey 30d
+
+/genkey 90d
+
+/genkey 1y
+
+/genkey lifetime
+
+## License Behavior
+
+A user must activate a valid license.
+
+The license allows unlimited downloads during
+the current bot session.
+
+After bot restart, users must activate the
+license again.
+
+The actual license remains stored in SQLite.
+
+## Key Normalization
+
+These are treated as the same key:
+
+NUTHH-AB12-CD34-EF56
+
+nuthh-ab12-cd34-ef56
+
+ NUTHH-AB12-CD34-EF56
+
+nuthh-ab12- cd34-ef56
+
+## Channels
+
+Channels are stored inside SQLite.
+
+No CHANNEL_ID environment variable is required.
+
+Add channels from:
+
+Owner Panel
+→ Add Channel
+
+Use:
+
+@channel_username
+
+The bot must be Administrator and have
+permission to Post Messages.
+
+## Railway
+
+Set:
+
+BOT_TOKEN
+OWNER_ID
+DATABASE_PATH
+
+Recommended:
+
+DATABASE_PATH=/data/nuthh.db
+
+If using a Railway Volume, mount it to:
+
+/data
+
+Then the SQLite database will survive
+service replacement/redeployment.
+
+## Security
+
+Never upload BOT_TOKEN to GitHub.
+
+If the token is exposed, revoke it through
+BotFather and generate a new token.
