@@ -28,7 +28,7 @@ from license import generate_key, calculate_expiry, format_expiry
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("8983376229:AAHhObqcUpd7e7z3Y8zpSYvh8jXs--jrWW4")
+BOT_TOKEN = os.getenv("8983376229:AAEZEvdtfScXDnkQx7PbvAn0OiagtY-RaqY")
 OWNER_ID = int(os.getenv("8736435737", "0"))
 
 URL_PATTERN = re.compile(
