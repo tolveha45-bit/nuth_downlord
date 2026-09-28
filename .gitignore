@@ -1,6 +1,13 @@
 .env
+.env.*
 __pycache__/
 *.pyc
-nuthh.db
+*.pyo
+*.pyd
 .venv/
 venv/
+env/
+nuthh.db
+*.sqlite
+*.sqlite3
+.DS_Store
