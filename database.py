@@ -1,209 +1,148 @@
 import sqlite3
 from datetime import datetime, timezone
 
-
 DATABASE = "nuthh.db"
 
 
 def get_connection():
-
-    conn = sqlite3.connect(
-        DATABASE,
-        check_same_thread=False,
-    )
-
+    conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
-
     return conn
 
 
 def init_db():
-
     conn = get_connection()
-    cur = conn.cursor()
+    cursor = conn.cursor()
 
-    # =====================================================
-    # USERS
-    # =====================================================
-
-    cur.execute(
+    cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT DEFAULT '',
             first_name TEXT DEFAULT '',
-            license_key TEXT,
-            joined_at TEXT,
-            role TEXT NOT NULL DEFAULT 'user'
+            license_key TEXT DEFAULT NULL,
+            joined_at TEXT NOT NULL,
+            role TEXT DEFAULT 'user'
         )
         """
     )
 
-    # =====================================================
-    # LICENSES
-    # =====================================================
-
-    cur.execute(
+    cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS licenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT UNIQUE NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active',
-            created_at TEXT,
-            expires_at TEXT,
-            activated_by INTEGER,
-            activated_at TEXT
+            status TEXT DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            expires_at TEXT DEFAULT NULL,
+            activated_by INTEGER DEFAULT NULL,
+            activated_at TEXT DEFAULT NULL
         )
         """
     )
 
-    # =====================================================
-    # CHANNELS
-    # =====================================================
-
-    cur.execute(
+    cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             title TEXT DEFAULT '',
-            added_at TEXT
+            added_at TEXT NOT NULL
         )
         """
     )
 
-    # =====================================================
-    # MIGRATION
-    # =====================================================
-
-    cur.execute(
-        "PRAGMA table_info(users)"
-    )
-
-    columns = [
-        row["name"]
-        for row in cur.fetchall()
-    ]
-
-    if "role" not in columns:
-
-        cur.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN role TEXT
-            NOT NULL DEFAULT 'user'
-            """
-        )
-
-    if "username" not in columns:
-
-        cur.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN username TEXT
-            DEFAULT ''
-            """
-        )
-
-    if "first_name" not in columns:
-
-        cur.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN first_name TEXT
-            DEFAULT ''
-            """
-        )
-
     conn.commit()
     conn.close()
 
-
-# =========================================================
-# USERS
-# =========================================================
 
 def ensure_user(
-    user_id,
-    username="",
-    first_name="",
+    user_id: int,
+    username: str = "",
+    first_name: str = "",
 ):
-
     conn = get_connection()
-    cur = conn.cursor()
+    cursor = conn.cursor()
 
-    cur.execute(
-        """
-        INSERT INTO users (
-            user_id,
-            username,
-            first_name,
-            joined_at
+    existing = cursor.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+
+    if existing:
+        cursor.execute(
+            """
+            UPDATE users
+            SET username = ?, first_name = ?
+            WHERE user_id = ?
+            """,
+            (
+                username,
+                first_name,
+                user_id,
+            ),
         )
-        VALUES (?, ?, ?, ?)
-
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
-        """,
-        (
-            user_id,
-            username,
-            first_name,
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-        ),
-    )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO users (
+                user_id,
+                username,
+                first_name,
+                joined_at,
+                role
+            )
+            VALUES (?, ?, ?, ?, 'user')
+            """,
+            (
+                user_id,
+                username,
+                first_name,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
 
     conn.commit()
     conn.close()
 
 
-def get_user_role(user_id):
-
+def get_user_role(user_id: int):
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT role
-        FROM users
-        WHERE user_id=?
-        """,
+    row = conn.execute(
+        "SELECT role FROM users WHERE user_id = ?",
         (user_id,),
-    )
-
-    row = cur.fetchone()
+    ).fetchone()
 
     conn.close()
 
     if not row:
         return "user"
 
-    return row["role"] or "user"
+    return row["role"]
 
 
 def set_user_role(
-    user_id,
-    role,
+    user_id: int,
+    role: str,
 ):
-
-    ensure_user(user_id)
-
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
+    conn.execute(
         """
-        UPDATE users
-        SET role=?
-        WHERE user_id=?
+        INSERT INTO users (
+            user_id,
+            joined_at,
+            role
+        )
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET role = excluded.role
         """,
         (
-            role,
             user_id,
+            datetime.now(timezone.utc).isoformat(),
+            role,
         ),
     )
 
@@ -211,255 +150,79 @@ def set_user_role(
     conn.close()
 
 
-def list_users():
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT *
-        FROM users
-        ORDER BY joined_at DESC
-        """
-    )
-
-    rows = cur.fetchall()
-
-    conn.close()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
-
-
-# =========================================================
-# LICENSE
-# =========================================================
-
 def create_license(
-    license_key,
-    expires_at=None,
+    license_key: str,
+    expires_at: str | None,
+    created_by: int,
 ):
-
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
+    conn.execute(
         """
         INSERT INTO licenses (
             license_key,
             status,
             created_at,
-            expires_at
-        )
-        VALUES (?, 'active', ?, ?)
-        """,
-        (
-            license_key,
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
             expires_at,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def get_license(
-    license_key,
-):
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT *
-        FROM licenses
-        WHERE license_key=?
-        """,
-        (license_key,),
-    )
-
-    row = cur.fetchone()
-
-    conn.close()
-
-    if not row:
-        return None
-
-    return dict(row)
-
-
-def activate_license(
-    user_id,
-    license_key,
-):
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT *
-        FROM licenses
-        WHERE license_key=?
-        """,
-        (license_key,),
-    )
-
-    row = cur.fetchone()
-
-    if not row:
-
-        conn.close()
-        return None
-
-    data = dict(row)
-
-    if data["status"] != "active":
-
-        conn.close()
-        return None
-
-    if data["activated_by"]:
-
-        if data["activated_by"] != user_id:
-
-            conn.close()
-            return None
-
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
-
-    cur.execute(
-        """
-        UPDATE licenses
-        SET
-            activated_by=?,
-            activated_at=?
-        WHERE license_key=?
-        """,
-        (
-            user_id,
-            now,
-            license_key,
-        ),
-    )
-
-    cur.execute(
-        """
-        UPDATE users
-        SET license_key=?
-        WHERE user_id=?
+            activated_by,
+            activated_at
+        )
+        VALUES (?, 'active', ?, ?, ?, NULL)
         """,
         (
             license_key,
-            user_id,
+            datetime.now(timezone.utc).isoformat(),
+            expires_at,
+            created_by,
         ),
     )
 
     conn.commit()
     conn.close()
 
-    return data
 
-
-def get_user_license(
-    user_id,
-):
-
+def get_license(license_key: str):
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT license_key
-        FROM users
-        WHERE user_id=?
-        """,
-        (user_id,),
-    )
-
-    row = cur.fetchone()
-
-    if not row or not row["license_key"]:
-
-        conn.close()
-        return None
-
-    key = row["license_key"]
-
-    cur.execute(
+    row = conn.execute(
         """
         SELECT *
         FROM licenses
-        WHERE license_key=?
+        WHERE license_key = ?
         """,
-        (key,),
-    )
-
-    license_row = cur.fetchone()
+        (license_key,),
+    ).fetchone()
 
     conn.close()
 
-    if not license_row:
-        return None
-
-    return dict(license_row)
+    return dict(row) if row else None
 
 
-def revoke_license(
-    license_key,
-):
-
+def revoke_license(license_key: str):
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
+    cursor = conn.execute(
         """
         UPDATE licenses
-        SET status='revoked'
-        WHERE license_key=?
+        SET status = 'revoked'
+        WHERE license_key = ?
         """,
         (license_key,),
     )
 
-    changed = cur.rowcount > 0
-
     conn.commit()
     conn.close()
 
-    return changed
+    return cursor.rowcount > 0
 
 
-def delete_license(
-    license_key,
-):
-
+def delete_license(license_key: str):
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
+    cursor = conn.execute(
         """
         DELETE FROM licenses
-        WHERE license_key=?
-        """,
-        (license_key,),
-    )
-
-    changed = cur.rowcount > 0
-
-    cur.execute(
-        """
-        UPDATE users
-        SET license_key=NULL
-        WHERE license_key=?
+        WHERE license_key = ?
         """,
         (license_key,),
     )
@@ -467,30 +230,39 @@ def delete_license(
     conn.commit()
     conn.close()
 
-    return changed
+    return cursor.rowcount > 0
 
 
 def list_licenses():
-
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
+    rows = conn.execute(
         """
         SELECT *
         FROM licenses
-        ORDER BY created_at DESC
+        ORDER BY id DESC
         """
-    )
-
-    rows = cur.fetchall()
+    ).fetchall()
 
     conn.close()
 
-    return [
-        dict(row)
-        for row in rows
-    ]
+    return [dict(row) for row in rows]
+
+
+def list_users():
+    conn = get_connection()
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM users
+        ORDER BY joined_at DESC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(row) for row in rows]
 
 
 # =========================================================
@@ -498,124 +270,66 @@ def list_licenses():
 # =========================================================
 
 def add_channel(
-    username,
-    title="",
+    username: str,
+    title: str = "",
 ):
-
-    username = username.lower().strip()
-
-    if not username.startswith("@"):
-
-        username = "@" + username
-
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
-        """
-        INSERT INTO channels (
-            username,
-            title,
-            added_at
+    try:
+        conn.execute(
+            """
+            INSERT INTO channels (
+                username,
+                title,
+                added_at
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                username,
+                title,
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
-        VALUES (?, ?, ?)
 
-        ON CONFLICT(username)
-        DO UPDATE SET
-            title=excluded.title
-        """,
-        (
-            username,
-            title,
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-        ),
-    )
+        conn.commit()
+        return True
 
-    conn.commit()
-    conn.close()
+    except sqlite3.IntegrityError:
+        return False
+
+    finally:
+        conn.close()
 
 
 def get_channels():
-
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
+    rows = conn.execute(
         """
         SELECT *
         FROM channels
-        ORDER BY added_at DESC
+        ORDER BY id ASC
         """
-    )
-
-    rows = cur.fetchall()
+    ).fetchall()
 
     conn.close()
 
-    return [
-        dict(row)
-        for row in rows
-    ]
+    return [dict(row) for row in rows]
 
 
-def get_channel(
-    username,
-):
-
-    username = username.lower().strip()
-
-    if not username.startswith("@"):
-
-        username = "@" + username
-
+def delete_channel(username: str):
     conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT *
-        FROM channels
-        WHERE username=?
-        """,
-        (username,),
-    )
-
-    row = cur.fetchone()
-
-    conn.close()
-
-    if not row:
-        return None
-
-    return dict(row)
-
-
-def delete_channel(
-    username,
-):
-
-    username = username.lower().strip()
-
-    if not username.startswith("@"):
-
-        username = "@" + username
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
+    cursor = conn.execute(
         """
         DELETE FROM channels
-        WHERE username=?
+        WHERE username = ?
         """,
         (username,),
     )
-
-    changed = cur.rowcount > 0
 
     conn.commit()
     conn.close()
 
-    return changed
+    return cursor.rowcount > 0
