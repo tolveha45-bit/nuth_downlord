@@ -29,8 +29,8 @@ from license import generate_key, calculate_expiry, format_expiry
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+BOT_TOKEN = os.getenv("8983376229:AAHhObqcUpd7e7z3Y8zpSYvh8jXs--jrWW4")
+OWNER_ID = int(os.getenv("8736435737", "0"))
 
 URL_PATTERN = re.compile(
     r"https?://(?:www\.)?(?:youtube\.com|youtu\.be|tiktok\.com)/\S+",
