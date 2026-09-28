@@ -1,8 +1,13 @@
 import os
 import re
+import asyncio
+import tempfile
+import shutil
+from pathlib import Path
 from datetime import datetime, timezone
 
-from dotenv import load_dotenv
+import yt_dlp
+import imageio_ffmpeg
 
 from telegram import (
     Update,
@@ -24,6 +29,7 @@ from database import (
     get_user_role,
     set_user_role,
     list_users,
+
     create_license,
     get_license,
     activate_license,
@@ -31,6 +37,11 @@ from database import (
     revoke_license,
     delete_license,
     list_licenses,
+
+    add_channel,
+    get_channels,
+    get_channel,
+    delete_channel,
 )
 
 from license import (
@@ -40,438 +51,634 @@ from license import (
 )
 
 
-# =========================
+# =========================================================
 # CONFIG
-# =========================
+# =========================================================
 
-load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MAIN_OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+MAIN_OWNER_ID = int(
+    os.getenv("OWNER_ID", "0")
+)
+
+MAX_FILE_SIZE_MB = 49
+MAX_FILE_SIZE_BYTES = (
+    MAX_FILE_SIZE_MB * 1024 * 1024
+)
+
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
 
 URL_PATTERN = re.compile(
-    r"https?://(?:www\.)?"
-    r"(?:youtube\.com|youtu\.be|tiktok\.com)/\S+",
-    re.IGNORECASE
+    r"(https?://(?:www\.)?"
+    r"(?:youtube\.com|youtu\.be|"
+    r"youtube-nocookie\.com|tiktok\.com)"
+    r"/\S+)",
+    re.IGNORECASE,
 )
 
 
-# =========================
-# HELPERS
-# =========================
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN is missing."
+    )
 
-def is_main_owner(user_id: int) -> bool:
-    return user_id == MAIN_OWNER_ID
+if MAIN_OWNER_ID == 0:
+    raise RuntimeError(
+        "OWNER_ID is missing or invalid."
+    )
 
+
+init_db()
+
+
+# =========================================================
+# ROLE
+# =========================================================
 
 def is_owner(user_id: int) -> bool:
+
     if user_id == MAIN_OWNER_ID:
         return True
 
     return get_user_role(user_id) == "owner"
 
 
-def license_active(user_id: int) -> bool:
-    license_row = get_user_license(user_id)
+# =========================================================
+# LICENSE
+# =========================================================
 
-    if not license_row:
-        return False
+def license_active(user_id: int):
 
-    if license_row["status"] != "active":
-        return False
+    data = get_user_license(user_id)
 
-    expires_at = license_row["expires_at"]
+    if not data:
+        return None
 
-    if not expires_at:
-        return True
+    key = data["license_key"]
 
-    try:
-        expires = datetime.fromisoformat(expires_at)
+    license_data = get_license(key)
 
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
+    if not license_data:
+        return None
 
-        if datetime.now(timezone.utc) >= expires:
-            revoke_license(license_row["license_key"])
-            return False
+    if license_data["status"] != "active":
+        return None
 
-    except Exception:
-        return False
+    expires_at = license_data["expires_at"]
 
-    return True
+    if expires_at:
+
+        try:
+
+            expiry = datetime.fromisoformat(
+                expires_at
+            )
+
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(
+                    tzinfo=timezone.utc
+                )
+
+            if datetime.now(
+                timezone.utc
+            ) >= expiry:
+
+                revoke_license(key)
+
+                return None
+
+        except Exception:
+
+            return None
+
+    return license_data
 
 
-def main_menu(user_id: int):
+# =========================================================
+# MAIN MENU
+# =========================================================
+
+def main_menu(user_id):
+
     buttons = [
         [
-            InlineKeyboardButton("🔑 Activate Key", callback_data="activate"),
-            InlineKeyboardButton("📋 My License", callback_data="my_license"),
+            InlineKeyboardButton(
+                "🔑 Activate Key",
+                callback_data="activate",
+            ),
+            InlineKeyboardButton(
+                "📋 My License",
+                callback_data="my_license",
+            ),
         ],
         [
-            InlineKeyboardButton("📥 Download", callback_data="download"),
-            InlineKeyboardButton("🆔 My ID", callback_data="my_id"),
+            InlineKeyboardButton(
+                "📥 Download",
+                callback_data="download",
+            ),
+            InlineKeyboardButton(
+                "🎵 MP3",
+                callback_data="mp3",
+            ),
         ],
         [
-            InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+            InlineKeyboardButton(
+                "🆔 My ID",
+                callback_data="my_id",
+            ),
+            InlineKeyboardButton(
+                "ℹ️ Help",
+                callback_data="help",
+            ),
         ],
     ]
 
     if is_owner(user_id):
-        buttons.append([
-            InlineKeyboardButton("👑 Owner Panel", callback_data="owner_panel")
-        ])
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "👑 Owner Panel",
+                    callback_data="owner_panel",
+                )
+            ]
+        )
 
     return InlineKeyboardMarkup(buttons)
 
 
+# =========================================================
+# OWNER MENU
+# =========================================================
+
 def owner_menu():
-    return InlineKeyboardMarkup([
+
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("➕ Generate Key", callback_data="genkey"),
-            InlineKeyboardButton("📋 All Keys", callback_data="keys"),
-        ],
-        [
-            InlineKeyboardButton("🔍 Key Info", callback_data="keyinfo"),
-            InlineKeyboardButton("🚫 Revoke Key", callback_data="revoke"),
-        ],
-        [
-            InlineKeyboardButton("🗑 Delete Key", callback_data="delete"),
-            InlineKeyboardButton("👥 Users", callback_data="users"),
-        ],
-        [
-            InlineKeyboardButton("👑 Set Owner", callback_data="set_owner"),
-            InlineKeyboardButton("👤 Set User", callback_data="set_user"),
-        ],
-        [
-            InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu"),
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "➕ Generate Key",
+                    callback_data="genkey_menu",
+                ),
+                InlineKeyboardButton(
+                    "📋 All Keys",
+                    callback_data="all_keys",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔍 Key Info",
+                    callback_data="key_info",
+                ),
+                InlineKeyboardButton(
+                    "🚫 Revoke Key",
+                    callback_data="revoke_key",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗑 Delete Key",
+                    callback_data="delete_key",
+                ),
+                InlineKeyboardButton(
+                    "👥 Users",
+                    callback_data="users",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📢 Channels",
+                    callback_data="channels",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "➕ Add Channel",
+                    callback_data="add_channel",
+                ),
+                InlineKeyboardButton(
+                    "🗑 Remove Channel",
+                    callback_data="remove_channel",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "👑 Set Owner",
+                    callback_data="set_owner",
+                ),
+                InlineKeyboardButton(
+                    "👤 Set User",
+                    callback_data="set_user",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="back_main",
+                )
+            ],
+        ]
+    )
 
 
-def duration_menu():
-    return InlineKeyboardMarkup([
+# =========================================================
+# DURATION MENU
+# =========================================================
+
+def duration_keyboard():
+
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("1 Day", callback_data="duration_1d"),
-            InlineKeyboardButton("7 Days", callback_data="duration_7d"),
-        ],
-        [
-            InlineKeyboardButton("30 Days", callback_data="duration_30d"),
-            InlineKeyboardButton("90 Days", callback_data="duration_90d"),
-        ],
-        [
-            InlineKeyboardButton("1 Year", callback_data="duration_1y"),
-            InlineKeyboardButton("Lifetime", callback_data="duration_lifetime"),
-        ],
-        [
-            InlineKeyboardButton("🔙 Back", callback_data="owner_panel"),
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "1 Day",
+                    callback_data="duration:1d",
+                ),
+                InlineKeyboardButton(
+                    "7 Days",
+                    callback_data="duration:7d",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "30 Days",
+                    callback_data="duration:30d",
+                ),
+                InlineKeyboardButton(
+                    "90 Days",
+                    callback_data="duration:90d",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "1 Year",
+                    callback_data="duration:1y",
+                ),
+                InlineKeyboardButton(
+                    "Lifetime",
+                    callback_data="duration:lifetime",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="owner_panel",
+                )
+            ],
+        ]
+    )
 
 
-# =========================
+# =========================================================
 # START
-# =========================
+# =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update, context):
+
     user = update.effective_user
 
-    ensure_user(user.id)
-
-    text = (
-        "🤖 *NUTHH BOT*\n\n"
-        f"👋 Hello, {user.first_name}!\n\n"
-        "Choose an option below:"
+    ensure_user(
+        user.id,
+        user.username or "",
+        user.first_name or "",
     )
 
     await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=main_menu(user.id)
+        "👋 Welcome to NUTHH Downloader\n\n"
+        "🎬 YouTube / TikTok Downloader\n"
+        "🎵 MP3 Converter\n"
+        "📢 Multi-Channel Auto Post\n\n"
+        "🔐 Activate License Key first.",
+        reply_markup=main_menu(user.id),
     )
 
 
-# =========================
-# CALLBACKS
-# =========================
+# =========================================================
+# HELP
+# =========================================================
 
-async def callback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def help_command(update, context):
+
+    user_id = update.effective_user.id
+
+    await update.message.reply_text(
+        "ℹ️ NUTHH Downloader\n\n"
+        "🔑 Activate Key\n"
+        "📥 Download MP4\n"
+        "🎵 Download MP3\n"
+        "📢 MP3 automatically posts "
+        "to all configured Channels.\n\n"
+        "Only content you have permission "
+        "to download/share should be used.",
+        reply_markup=main_menu(user_id),
+    )
+
+
+# =========================================================
+# LICENSE CHECK
+# =========================================================
+
+async def require_license(update):
+
+    user_id = update.effective_user.id
+
+    if license_active(user_id):
+        return True
+
+    await update.effective_message.reply_text(
+        "🔒 License Required\n\n"
+        "Please activate your License Key first.",
+        reply_markup=main_menu(user_id),
+    )
+
+    return False
+
+
+# =========================================================
+# BUTTON HANDLER
+# =========================================================
+
+async def button_handler(update, context):
+
     query = update.callback_query
 
     await query.answer()
 
-    user = query.from_user
-    user_id = user.id
+    user_id = query.from_user.id
     data = query.data
 
-    ensure_user(user_id)
+    ensure_user(
+        user_id,
+        query.from_user.username or "",
+        query.from_user.first_name or "",
+    )
 
-    # =====================
-    # MAIN MENU
-    # =====================
+    # =====================================================
+    # BACK
+    # =====================================================
 
-    if data == "main_menu":
+    if data == "back_main":
+
         await query.edit_message_text(
-            "🤖 *NUTHH BOT*\n\nChoose an option:",
-            parse_mode="Markdown",
-            reply_markup=main_menu(user_id)
+            "🏠 NUTHH Downloader",
+            reply_markup=main_menu(user_id),
         )
+
         return
 
-    # =====================
+    # =====================================================
     # ACTIVATE
-    # =====================
+    # =====================================================
 
     if data == "activate":
-        context.user_data["waiting"] = "activate_key"
+
+        context.user_data[
+            "waiting_for_key"
+        ] = True
 
         await query.edit_message_text(
-            "🔐 *Activate License*\n\n"
-            "Please send your license key.\n\n"
+            "🔑 Activate License\n\n"
+            "Send your License Key.\n\n"
             "Example:\n"
-            "`NUTHH-ABCD-EFGH-IJKL`",
+            "`NUTHH-ABCD-1234-WXYZ`",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="main_menu"
-                    )
-                ]
-            ])
         )
+
         return
 
-    # =====================
+    # =====================================================
     # MY LICENSE
-    # =====================
+    # =====================================================
 
     if data == "my_license":
-        license_row = get_user_license(user_id)
 
-        if not license_row:
-            text = (
-                "🔐 *My License*\n\n"
-                "❌ No active license.\n\n"
-                "Please activate a key first."
+        data_license = license_active(
+            user_id
+        )
+
+        if not data_license:
+
+            await query.edit_message_text(
+                "🔒 No active License.",
+                reply_markup=main_menu(user_id),
             )
-        else:
-            expires = license_row["expires_at"]
 
-            if expires:
-                expiry_text = format_expiry(expires)
-            else:
-                expiry_text = "Lifetime"
-
-            text = (
-                "🔐 *My License*\n\n"
-                f"🔑 Key: `{license_row['license_key']}`\n"
-                f"📌 Status: `{license_row['status']}`\n"
-                f"📅 Expires: `{expiry_text}`"
-            )
+            return
 
         await query.edit_message_text(
-            text,
+            "📋 My License\n\n"
+            f"🔑 `{data_license['license_key']}`\n"
+            f"📌 Status: {data_license['status']}\n"
+            f"📅 Expires: "
+            f"{format_expiry(data_license['expires_at'])}",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Back",
-                        callback_data="main_menu"
-                    )
-                ]
-            ])
+            reply_markup=main_menu(user_id),
         )
+
         return
 
-    # =====================
+    # =====================================================
     # MY ID
-    # =====================
+    # =====================================================
 
     if data == "my_id":
+
         await query.edit_message_text(
-            "🆔 *Your Telegram ID*\n\n"
-            f"`{user_id}`",
+            f"🆔 Telegram ID\n\n`{user_id}`",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Back",
-                        callback_data="main_menu"
-                    )
-                ]
-            ])
+            reply_markup=main_menu(user_id),
         )
+
         return
 
-    # =====================
+    # =====================================================
+    # HELP
+    # =====================================================
+
+    if data == "help":
+
+        await query.edit_message_text(
+            "ℹ️ Help\n\n"
+            "1️⃣ Activate Key\n"
+            "2️⃣ Choose Download or MP3\n"
+            "3️⃣ Send URL\n\n"
+            "🎵 MP3 will be posted to "
+            "all configured Channels.",
+            reply_markup=main_menu(user_id),
+        )
+
+        return
+
+    # =====================================================
     # DOWNLOAD
-    # =====================
+    # =====================================================
 
     if data == "download":
-        if not license_active(user_id):
-            await query.edit_message_text(
-                "🔒 *License Required*\n\n"
-                "You need an active license key before using "
-                "the downloader.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "🔑 Activate Key",
-                            callback_data="activate"
-                        )
-                    ],
+
+        if not await require_license(update):
+            return
+
+        context.user_data[
+            "download_mode"
+        ] = "video"
+
+        await query.edit_message_text(
+            "📥 Download Video\n\n"
+            "Send YouTube/TikTok URL.",
+            reply_markup=InlineKeyboardMarkup(
+                [
                     [
                         InlineKeyboardButton(
                             "🔙 Back",
-                            callback_data="main_menu"
+                            callback_data="back_main",
                         )
-                    ],
-                ])
-            )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # =====================================================
+    # MP3
+    # =====================================================
+
+    if data == "mp3":
+
+        if not await require_license(update):
             return
 
-        context.user_data["waiting"] = "download_url"
+        context.user_data[
+            "download_mode"
+        ] = "mp3"
 
         await query.edit_message_text(
-            "📥 *Download Video*\n\n"
-            "Send a YouTube or TikTok link now.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
+            "🎵 MP3 Downloader\n\n"
+            "Send YouTube/TikTok URL.\n\n"
+            "MP3 will be sent to you and "
+            "all configured Channels.",
+            reply_markup=InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="main_menu"
-                    )
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="back_main",
+                        )
+                    ]
                 ]
-            ])
+            ),
         )
+
         return
 
-    # =====================
-    # HELP
-    # =====================
-
-    if data == "help":
-        await query.edit_message_text(
-            "ℹ️ *NUTHH BOT Help*\n\n"
-            "🔑 Activate Key — activate your license\n"
-            "📋 My License — check your license\n"
-            "📥 Download — send a supported video URL\n"
-            "🆔 My ID — show your Telegram ID",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Back",
-                        callback_data="main_menu"
-                    )
-                ]
-            ])
-        )
-        return
-
-    # =====================
+    # =====================================================
     # OWNER PANEL
-    # =====================
+    # =====================================================
 
     if data == "owner_panel":
+
         if not is_owner(user_id):
-            await query.edit_message_text("❌ Owner only.")
+
+            await query.edit_message_text(
+                "❌ Owner only."
+            )
+
             return
 
         await query.edit_message_text(
-            "👑 *OWNER PANEL*\n\n"
-            "Choose an action:",
-            parse_mode="Markdown",
-            reply_markup=owner_menu()
+            "👑 NUTHH Owner Panel",
+            reply_markup=owner_menu(),
         )
+
         return
 
-    # =====================
+    # =====================================================
     # GENERATE KEY
-    # =====================
+    # =====================================================
 
-    if data == "genkey":
-        if not is_owner(user_id):
-            await query.edit_message_text("❌ Owner only.")
+    if data == "genkey_menu":
+
+        if user_id != MAIN_OWNER_ID:
+
+            await query.edit_message_text(
+                "❌ Main Owner only."
+            )
+
             return
 
         await query.edit_message_text(
-            "➕ *Generate License Key*\n\n"
-            "Select duration:",
-            parse_mode="Markdown",
-            reply_markup=duration_menu()
+            "➕ Generate License Key\n\n"
+            "Choose duration:",
+            reply_markup=duration_keyboard(),
         )
+
         return
 
-    if data.startswith("duration_"):
-        if not is_owner(user_id):
-            await query.edit_message_text("❌ Owner only.")
+    # =====================================================
+    # DURATION
+    # =====================================================
+
+    if data.startswith("duration:"):
+
+        if user_id != MAIN_OWNER_ID:
             return
 
-        duration = data.replace("duration_", "")
+        duration = data.split(
+            ":",
+            1
+        )[1]
 
         key = generate_key()
-        expires_at = calculate_expiry(duration)
 
-        create_license(key, expires_at)
+        expires_at = calculate_expiry(
+            duration
+        )
 
-        expiry_text = (
-            "Lifetime"
-            if expires_at is None
-            else format_expiry(expires_at)
+        create_license(
+            key,
+            expires_at,
         )
 
         await query.edit_message_text(
-            "✅ *License Created*\n\n"
-            f"🔑 Key:\n`{key}`\n\n"
-            f"⏳ Duration: `{duration}`\n"
-            f"📅 Expires: `{expiry_text}`",
+            "✅ License Created\n\n"
+            f"🔑 `{key}`\n"
+            f"⏳ {duration}\n"
+            f"📅 {format_expiry(expires_at)}",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "➕ Generate Another",
-                        callback_data="genkey"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔙 Owner Panel",
-                        callback_data="owner_panel"
-                    )
-                ],
-            ])
+            reply_markup=owner_menu(),
         )
+
         return
 
-    # =====================
+    # =====================================================
     # ALL KEYS
-    # =====================
+    # =====================================================
 
-    if data == "keys":
+    if data == "all_keys":
+
         if not is_owner(user_id):
-            await query.edit_message_text("❌ Owner only.")
             return
 
-        rows = list_licenses()
+        licenses = list_licenses()
 
-        if not rows:
-            text = "📋 *License Keys*\n\nNo keys found."
+        if not licenses:
+
+            text = "📋 No License Keys."
+
         else:
-            lines = ["📋 *License Keys*\n"]
 
-            for row in rows[:30]:
-                status = row["status"]
-                key = row["license_key"]
+            lines = [
+                "📋 License Keys\n"
+            ]
+
+            for item in licenses[:50]:
 
                 lines.append(
-                    f"🔑 `{key}`\n"
-                    f"Status: `{status}`\n"
+                    f"🔑 `{item['license_key']}`\n"
+                    f"📌 {item['status']}\n"
+                    f"📅 "
+                    f"{format_expiry(item['expires_at'])}\n"
                 )
 
             text = "\n".join(lines)
@@ -479,41 +686,208 @@ async def callback_handler(
         await query.edit_message_text(
             text,
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Owner Panel",
-                        callback_data="owner_panel"
-                    )
-                ]
-            ])
+            reply_markup=owner_menu(),
         )
+
         return
 
-    # =====================
+    # =====================================================
+    # KEY INFO
+    # =====================================================
+
+    if data == "key_info":
+
+        if not is_owner(user_id):
+            return
+
+        context.user_data[
+            "owner_action"
+        ] = "key_info"
+
+        await query.edit_message_text(
+            "🔍 Key Info\n\n"
+            "Send License Key.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="owner_panel",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # =====================================================
+    # REVOKE
+    # =====================================================
+
+    if data == "revoke_key":
+
+        if user_id != MAIN_OWNER_ID:
+            return
+
+        context.user_data[
+            "owner_action"
+        ] = "revoke"
+
+        await query.edit_message_text(
+            "🚫 Revoke License\n\n"
+            "Send License Key.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="owner_panel",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # =====================================================
+    # DELETE KEY
+    # =====================================================
+
+    if data == "delete_key":
+
+        if user_id != MAIN_OWNER_ID:
+            return
+
+        context.user_data[
+            "owner_action"
+        ] = "delete"
+
+        await query.edit_message_text(
+            "🗑 Delete License\n\n"
+            "Send License Key.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="owner_panel",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # =====================================================
     # USERS
-    # =====================
+    # =====================================================
 
     if data == "users":
+
         if not is_owner(user_id):
-            await query.edit_message_text("❌ Owner only.")
             return
 
-        rows = list_users()
+        users = list_users()
 
-        if not rows:
-            text = "👥 No users found."
+        lines = [
+            "👥 Users\n"
+        ]
+
+        for user in users[:50]:
+
+            lines.append(
+                f"🆔 `{user['user_id']}`\n"
+                f"👤 Role: "
+                f"{user.get('role', 'user')}\n"
+                f"🔑 License: "
+                f"{user.get('license_key') or 'None'}\n"
+            )
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=owner_menu(),
+        )
+
+        return
+
+    # =====================================================
+    # ADD CHANNEL
+    # =====================================================
+
+    if data == "add_channel":
+
+        if user_id != MAIN_OWNER_ID:
+
+            await query.edit_message_text(
+                "❌ Main Owner only."
+            )
+
+            return
+
+        context.user_data[
+            "owner_action"
+        ] = "add_channel"
+
+        await query.edit_message_text(
+            "➕ Add Telegram Channel\n\n"
+            "Send the Channel username.\n\n"
+            "Example:\n"
+            "`@song_chill22`\n\n"
+            "The Bot must already be an "
+            "Administrator of that Channel "
+            "with Post Messages permission.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="owner_panel",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # =====================================================
+    # CHANNEL LIST
+    # =====================================================
+
+    if data == "channels":
+
+        if not is_owner(user_id):
+            return
+
+        channels = get_channels()
+
+        if not channels:
+
+            text = (
+                "📢 Channels\n\n"
+                "No Channels added yet.\n\n"
+                "Press ➕ Add Channel."
+            )
+
         else:
-            lines = ["👥 *Users*\n"]
 
-            for row in rows[:30]:
-                role = row["role"]
-                uid = row["user_id"]
+            lines = [
+                "📢 Configured Channels\n"
+            ]
 
-                icon = "👑" if role == "owner" else "👤"
+            for index, channel in enumerate(
+                channels,
+                start=1,
+            ):
 
                 lines.append(
-                    f"{icon} `{uid}` — `{role}`"
+                    f"{index}. "
+                    f"`{channel['username']}`"
                 )
 
             text = "\n".join(lines)
@@ -521,438 +895,1175 @@ async def callback_handler(
         await query.edit_message_text(
             text,
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Owner Panel",
-                        callback_data="owner_panel"
-                    )
-                ]
-            ])
+            reply_markup=owner_menu(),
         )
+
         return
 
-    # =====================
+    # =====================================================
+    # REMOVE CHANNEL
+    # =====================================================
+
+    if data == "remove_channel":
+
+        if user_id != MAIN_OWNER_ID:
+            return
+
+        context.user_data[
+            "owner_action"
+        ] = "remove_channel"
+
+        channels = get_channels()
+
+        if not channels:
+
+            await query.edit_message_text(
+                "📢 No Channels to remove.",
+                reply_markup=owner_menu(),
+            )
+
+            return
+
+        lines = [
+            "🗑 Remove Channel\n",
+            "Send the username of the Channel.\n",
+        ]
+
+        for channel in channels:
+
+            lines.append(
+                f"• `{channel['username']}`"
+            )
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="owner_panel",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # =====================================================
     # SET OWNER
-    # =====================
+    # =====================================================
 
     if data == "set_owner":
-        if not is_main_owner(user_id):
-            await query.edit_message_text(
-                "❌ Only the Main Owner can change roles."
-            )
+
+        if user_id != MAIN_OWNER_ID:
             return
 
-        context.user_data["waiting"] = "set_owner"
+        context.user_data[
+            "owner_action"
+        ] = "set_owner"
 
         await query.edit_message_text(
-            "👑 *Set Owner*\n\n"
-            "Send the Telegram User ID you want to promote.\n\n"
-            "Example:\n"
-            "`123456789`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
+            "👑 Set Owner\n\n"
+            "Send Telegram User ID.",
+            reply_markup=InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="owner_panel"
-                    )
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="owner_panel",
+                        )
+                    ]
                 ]
-            ])
+            ),
         )
+
         return
 
-    # =====================
+    # =====================================================
     # SET USER
-    # =====================
+    # =====================================================
 
     if data == "set_user":
-        if not is_main_owner(user_id):
-            await query.edit_message_text(
-                "❌ Only the Main Owner can change roles."
-            )
+
+        if user_id != MAIN_OWNER_ID:
             return
 
-        context.user_data["waiting"] = "set_user"
+        context.user_data[
+            "owner_action"
+        ] = "set_user"
 
         await query.edit_message_text(
-            "👤 *Set User*\n\n"
-            "Send the Telegram User ID you want to change to User.\n\n"
-            "Example:\n"
-            "`123456789`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
+            "👤 Set User\n\n"
+            "Send Telegram User ID.",
+            reply_markup=InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="owner_panel"
-                    )
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="owner_panel",
+                        )
+                    ]
                 ]
-            ])
+            ),
         )
-        return
 
-    # =====================
-    # KEY INFO
-    # =====================
-
-    if data == "keyinfo":
-        if not is_owner(user_id):
-            await query.edit_message_text("❌ Owner only.")
-            return
-
-        context.user_data["waiting"] = "keyinfo"
-
-        await query.edit_message_text(
-            "🔍 *Key Info*\n\n"
-            "Send the license key.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="owner_panel"
-                    )
-                ]
-            ])
-        )
-        return
-
-    # =====================
-    # REVOKE
-    # =====================
-
-    if data == "revoke":
-        if not is_owner(user_id):
-            await query.edit_message_text("❌ Owner only.")
-            return
-
-        context.user_data["waiting"] = "revoke"
-
-        await query.edit_message_text(
-            "🚫 *Revoke Key*\n\n"
-            "Send the license key to revoke.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="owner_panel"
-                    )
-                ]
-            ])
-        )
-        return
-
-    # =====================
-    # DELETE
-    # =====================
-
-    if data == "delete":
-        if not is_owner(user_id):
-            await query.edit_message_text("❌ Owner only.")
-            return
-
-        context.user_data["waiting"] = "delete"
-
-        await query.edit_message_text(
-            "🗑 *Delete Key*\n\n"
-            "Send the license key to delete.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="owner_panel"
-                    )
-                ]
-            ])
-        )
         return
 
 
-# =========================
+# =========================================================
 # TEXT HANDLER
-# =========================
+# =========================================================
 
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def text_handler(
+    update,
+    context,
 ):
+
+    if not update.message:
+        return
+
     user = update.effective_user
+
+    if not user:
+        return
+
     user_id = user.id
-
-    ensure_user(user_id)
-
     text = update.message.text.strip()
 
-    waiting = context.user_data.get("waiting")
+    ensure_user(
+        user_id,
+        user.username or "",
+        user.first_name or "",
+    )
 
-    # =====================
+    # =====================================================
     # ACTIVATE KEY
-    # =====================
+    # =====================================================
 
-    if waiting == "activate_key":
+    if context.user_data.get(
+        "waiting_for_key"
+    ):
 
-        success, reason = activate_license(text, user_id)
+        context.user_data[
+            "waiting_for_key"
+        ] = False
 
-        context.user_data.pop("waiting", None)
+        key = text.upper()
 
-        if success:
-            license_row = get_user_license(user_id)
+        result = activate_license(
+            user_id,
+            key,
+        )
 
-            expiry = license_row["expires_at"]
-
-            expiry_text = (
-                "Lifetime"
-                if not expiry
-                else format_expiry(expiry)
-            )
+        if result:
 
             await update.message.reply_text(
-                "✅ *License Activated!*\n\n"
-                f"🔑 Key: `{text}`\n"
-                f"📅 Expires: `{expiry_text}`\n\n"
-                "🎬 You can now use the downloader.",
+                "✅ License Activated!\n\n"
+                f"🔑 `{key}`\n"
+                f"📅 Expires: "
+                f"{format_expiry(result['expires_at'])}",
                 parse_mode="Markdown",
-                reply_markup=main_menu(user_id)
+                reply_markup=main_menu(user_id),
             )
-            return
 
-        messages = {
-            "not_found": "❌ License key not found.",
-            "inactive": "❌ This license is inactive.",
-            "used": "❌ This key is already activated by another account.",
-        }
+        else:
 
-        await update.message.reply_text(
-            messages.get(reason, "❌ Unable to activate key."),
-            reply_markup=main_menu(user_id)
-        )
+            await update.message.reply_text(
+                "❌ Invalid, expired, revoked, "
+                "or already-used key.",
+                reply_markup=main_menu(user_id),
+            )
+
         return
 
-    # =====================
-    # SET OWNER
-    # =====================
+    # =====================================================
+    # OWNER ACTION
+    # =====================================================
 
-    if waiting == "set_owner":
+    if is_owner(user_id):
 
-        if not is_main_owner(user_id):
-            await update.message.reply_text("❌ Main Owner only.")
-            return
+        action = context.user_data.get(
+            "owner_action"
+        )
 
-        try:
-            target_id = int(text)
+        if action:
 
-            if target_id == MAIN_OWNER_ID:
-                await update.message.reply_text(
-                    "ℹ️ This account is already the Main Owner."
+            context.user_data[
+                "owner_action"
+            ] = None
+
+            # ---------------------------------------------
+            # ADD CHANNEL
+            # ---------------------------------------------
+
+            if action == "add_channel":
+
+                if user_id != MAIN_OWNER_ID:
+                    return
+
+                username = text.strip()
+
+                if username.startswith(
+                    "https://t.me/"
+                ):
+
+                    username = (
+                        "@"
+                        + username
+                        .split(
+                            "https://t.me/",
+                            1
+                        )[1]
+                        .split(
+                            "?",
+                            1
+                        )[0]
+                        .strip("/")
+                    )
+
+                elif username.startswith(
+                    "t.me/"
+                ):
+
+                    username = (
+                        "@"
+                        + username
+                        .split(
+                            "t.me/",
+                            1
+                        )[1]
+                        .split(
+                            "?",
+                            1
+                        )[0]
+                        .strip("/")
+                    )
+
+                if not username.startswith("@"):
+
+                    username = (
+                        "@"
+                        + username
+                    )
+
+                username = username.lower()
+
+                if not re.fullmatch(
+                    r"@[a-zA-Z0-9_]{5,32}",
+                    username,
+                ):
+
+                    await update.message.reply_text(
+                        "❌ Invalid Channel username.\n\n"
+                        "Example: `@song_chill22`",
+                        parse_mode="Markdown",
+                        reply_markup=owner_menu(),
+                    )
+
+                    return
+
+                # Test channel access
+                try:
+
+                    chat = await context.bot.get_chat(
+                        username
+                    )
+
+                    me = await context.bot.get_me()
+
+                    member = (
+                        await context.bot.get_chat_member(
+                            chat.id,
+                            me.id,
+                        )
+                    )
+
+                    if member.status not in (
+                        "administrator",
+                        "creator",
+                    ):
+
+                        await update.message.reply_text(
+                            "❌ Bot is not an "
+                            "Administrator of this Channel.\n\n"
+                            f"Channel: {username}",
+                            reply_markup=owner_menu(),
+                        )
+
+                        return
+
+                    add_channel(
+                        username=username,
+                        title=chat.title or username,
+                    )
+
+                    await update.message.reply_text(
+                        "✅ Channel Added!\n\n"
+                        f"📢 {username}\n"
+                        f"📝 {chat.title or 'Channel'}\n\n"
+                        "MP3 will now be posted "
+                        "to this Channel.",
+                        reply_markup=owner_menu(),
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "ADD CHANNEL ERROR:",
+                        repr(e),
+                    )
+
+                    await update.message.reply_text(
+                        "❌ Could not add Channel.\n\n"
+                        "Make sure:\n"
+                        "• Channel is public\n"
+                        "• Bot is Administrator\n"
+                        "• Bot has Post Messages permission\n"
+                        "• Username is correct",
+                        reply_markup=owner_menu(),
+                    )
+
+                return
+
+            # ---------------------------------------------
+            # REMOVE CHANNEL
+            # ---------------------------------------------
+
+            if action == "remove_channel":
+
+                if user_id != MAIN_OWNER_ID:
+                    return
+
+                username = text.strip()
+
+                if username.startswith(
+                    "https://t.me/"
+                ):
+
+                    username = (
+                        "@"
+                        + username.split(
+                            "https://t.me/",
+                            1
+                        )[1]
+                        .split(
+                            "?",
+                            1
+                        )[0]
+                        .strip("/")
+                    )
+
+                elif not username.startswith("@"):
+
+                    username = (
+                        "@"
+                        + username
+                    )
+
+                success = delete_channel(
+                    username.lower()
                 )
-            else:
-                set_user_role(target_id, "owner")
+
+                if success:
+
+                    await update.message.reply_text(
+                        "🗑 Channel Removed\n\n"
+                        f"📢 {username}",
+                        reply_markup=owner_menu(),
+                    )
+
+                else:
+
+                    await update.message.reply_text(
+                        "❌ Channel was not found.",
+                        reply_markup=owner_menu(),
+                    )
+
+                return
+
+            # ---------------------------------------------
+            # KEY INFO
+            # ---------------------------------------------
+
+            if action == "key_info":
+
+                data = get_license(
+                    text.upper()
+                )
+
+                if not data:
+
+                    await update.message.reply_text(
+                        "❌ Key not found.",
+                        reply_markup=owner_menu(),
+                    )
+
+                    return
 
                 await update.message.reply_text(
-                    f"👑 User `{target_id}` is now an Owner.",
+                    "🔍 License Info\n\n"
+                    f"🔑 `{data['license_key']}`\n"
+                    f"📌 {data['status']}\n"
+                    f"📅 "
+                    f"{format_expiry(data['expires_at'])}\n"
+                    f"👤 "
+                    f"{data.get('activated_by') or 'None'}",
                     parse_mode="Markdown",
-                    reply_markup=owner_menu()
+                    reply_markup=owner_menu(),
                 )
 
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Invalid Telegram User ID."
-            )
+                return
 
-        context.user_data.pop("waiting", None)
-        return
+            # ---------------------------------------------
+            # REVOKE
+            # ---------------------------------------------
 
-    # =====================
-    # SET USER
-    # =====================
+            if action == "revoke":
 
-    if waiting == "set_user":
-
-        if not is_main_owner(user_id):
-            await update.message.reply_text("❌ Main Owner only.")
-            return
-
-        try:
-            target_id = int(text)
-
-            if target_id == MAIN_OWNER_ID:
-                await update.message.reply_text(
-                    "❌ The Main Owner cannot be changed to User."
+                success = revoke_license(
+                    text.upper()
                 )
-            else:
-                set_user_role(target_id, "user")
 
                 await update.message.reply_text(
-                    f"👤 User `{target_id}` is now a normal User.",
-                    parse_mode="Markdown",
-                    reply_markup=owner_menu()
+                    "✅ License revoked."
+                    if success
+                    else "❌ Key not found.",
+                    reply_markup=owner_menu(),
                 )
 
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Invalid Telegram User ID."
-            )
+                return
 
-        context.user_data.pop("waiting", None)
-        return
+            # ---------------------------------------------
+            # DELETE
+            # ---------------------------------------------
 
-    # =====================
-    # KEY INFO
-    # =====================
+            if action == "delete":
 
-    if waiting == "keyinfo":
+                success = delete_license(
+                    text.upper()
+                )
 
-        if not is_owner(user_id):
+                await update.message.reply_text(
+                    "🗑 License deleted."
+                    if success
+                    else "❌ Key not found.",
+                    reply_markup=owner_menu(),
+                )
+
+                return
+
+            # ---------------------------------------------
+            # SET OWNER
+            # ---------------------------------------------
+
+            if action == "set_owner":
+
+                try:
+
+                    target_id = int(text)
+
+                    ensure_user(target_id)
+
+                    set_user_role(
+                        target_id,
+                        "owner",
+                    )
+
+                    await update.message.reply_text(
+                        f"👑 `{target_id}` is now Owner.",
+                        parse_mode="Markdown",
+                        reply_markup=owner_menu(),
+                    )
+
+                except ValueError:
+
+                    await update.message.reply_text(
+                        "❌ Invalid Telegram ID.",
+                        reply_markup=owner_menu(),
+                    )
+
+                return
+
+            # ---------------------------------------------
+            # SET USER
+            # ---------------------------------------------
+
+            if action == "set_user":
+
+                try:
+
+                    target_id = int(text)
+
+                    if target_id == MAIN_OWNER_ID:
+
+                        await update.message.reply_text(
+                            "❌ Main Owner cannot be changed.",
+                            reply_markup=owner_menu(),
+                        )
+
+                        return
+
+                    ensure_user(target_id)
+
+                    set_user_role(
+                        target_id,
+                        "user",
+                    )
+
+                    await update.message.reply_text(
+                        f"👤 `{target_id}` is now User.",
+                        parse_mode="Markdown",
+                        reply_markup=owner_menu(),
+                    )
+
+                except ValueError:
+
+                    await update.message.reply_text(
+                        "❌ Invalid Telegram ID.",
+                        reply_markup=owner_menu(),
+                    )
+
+                return
+
+    # =====================================================
+    # URL
+    # =====================================================
+
+    match = URL_PATTERN.search(text)
+
+    if match:
+
+        if not await require_license(update):
             return
 
-        row = get_license(text)
+        url = match.group(1)
 
-        context.user_data.pop("waiting", None)
-
-        if not row:
-            await update.message.reply_text(
-                "❌ Key not found.",
-                reply_markup=owner_menu()
-            )
-            return
-
-        activated = row["activated_by"]
-
-        await update.message.reply_text(
-            "🔍 *Key Information*\n\n"
-            f"🔑 `{row['license_key']}`\n"
-            f"📌 Status: `{row['status']}`\n"
-            f"👤 Activated By: `{activated or 'None'}`\n"
-            f"📅 Expires: `{row['expires_at'] or 'Lifetime'}`",
-            parse_mode="Markdown",
-            reply_markup=owner_menu()
+        mode = context.user_data.get(
+            "download_mode",
+            "video",
         )
-        return
 
-    # =====================
-    # REVOKE
-    # =====================
-
-    if waiting == "revoke":
-
-        if not is_owner(user_id):
-            return
-
-        revoke_license(text)
-
-        context.user_data.pop("waiting", None)
-
-        await update.message.reply_text(
-            "🚫 License revoked.",
-            reply_markup=owner_menu()
+        await process_download(
+            update,
+            url,
+            mode,
         )
+
         return
 
-    # =====================
-    # DELETE
-    # =====================
-
-    if waiting == "delete":
-
-        if not is_owner(user_id):
-            return
-
-        delete_license(text)
-
-        context.user_data.pop("waiting", None)
-
-        await update.message.reply_text(
-            "🗑 License deleted.",
-            reply_markup=owner_menu()
-        )
-        return
-
-    # =====================
-    # DOWNLOAD URL
-    # =====================
-
-    if URL_PATTERN.search(text):
-
-        if not license_active(user_id):
-            await update.message.reply_text(
-                "🔒 You need an active license key first.",
-                reply_markup=main_menu(user_id)
-            )
-            return
-
-        await update.message.reply_text(
-            "⏳ Link received.\n\n"
-            "The downloader engine is ready to be connected "
-            "to an authorized download/API provider.\n\n"
-            f"🔗 `{text}`",
-            parse_mode="Markdown",
-            reply_markup=main_menu(user_id)
-        )
-        return
-
-    # =====================
+    # =====================================================
     # DEFAULT
-    # =====================
+    # =====================================================
 
     await update.message.reply_text(
-        "Please use the buttons below 👇",
-        reply_markup=main_menu(user_id)
+        "👇 Please use the buttons.",
+        reply_markup=main_menu(user_id),
     )
 
 
-# =========================
-# COMMAND FALLBACK
-# =========================
+# =========================================================
+# DOWNLOAD VIDEO
+# =========================================================
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+def download_video(
+    url,
+    output_dir,
 ):
-    await update.message.reply_text(
-        "Use the buttons below 👇",
-        reply_markup=main_menu(update.effective_user.id)
+
+    output_template = os.path.join(
+        output_dir,
+        "%(title).80s.%(ext)s",
+    )
+
+    options = {
+        "format":
+            "bestvideo[ext=mp4]+"
+            "bestaudio[ext=m4a]/"
+            "best[ext=mp4]/best",
+
+        "outtmpl":
+            output_template,
+
+        "merge_output_format":
+            "mp4",
+
+        "noplaylist":
+            True,
+
+        "retries":
+            3,
+
+        "fragment_retries":
+            3,
+
+        "continuedl":
+            True,
+
+        "restrictfilenames":
+            True,
+
+        "quiet":
+            True,
+
+        "no_warnings":
+            True,
+
+        "ffmpeg_location":
+            FFMPEG_PATH,
+    }
+
+    with yt_dlp.YoutubeDL(
+        options
+    ) as ydl:
+
+        info = ydl.extract_info(
+            url,
+            download=True,
+        )
+
+        title = info.get(
+            "title",
+            "NUTHH Video",
+        )
+
+        files = list(
+            Path(output_dir).glob("*")
+        )
+
+        video_files = [
+            f
+            for f in files
+            if f.is_file()
+            and f.suffix.lower()
+            in {
+                ".mp4",
+                ".mkv",
+                ".webm",
+                ".mov",
+            }
+        ]
+
+        if not video_files:
+
+            raise RuntimeError(
+                "Video file not found."
+            )
+
+        video_file = max(
+            video_files,
+            key=lambda x:
+            x.stat().st_mtime,
+        )
+
+        return video_file, title
+
+
+# =========================================================
+# DOWNLOAD MP3
+# =========================================================
+
+def download_mp3(
+    url,
+    output_dir,
+):
+
+    output_template = os.path.join(
+        output_dir,
+        "%(title).80s.%(ext)s",
+    )
+
+    options = {
+        "format":
+            "bestaudio/best",
+
+        "outtmpl":
+            output_template,
+
+        "noplaylist":
+            True,
+
+        "retries":
+            3,
+
+        "fragment_retries":
+            3,
+
+        "continuedl":
+            True,
+
+        "restrictfilenames":
+            True,
+
+        "quiet":
+            True,
+
+        "no_warnings":
+            True,
+
+        "ffmpeg_location":
+            FFMPEG_PATH,
+
+        "postprocessors": [
+            {
+                "key":
+                    "FFmpegExtractAudio",
+
+                "preferredcodec":
+                    "mp3",
+
+                "preferredquality":
+                    "192",
+            }
+        ],
+    }
+
+    with yt_dlp.YoutubeDL(
+        options
+    ) as ydl:
+
+        info = ydl.extract_info(
+            url,
+            download=True,
+        )
+
+        title = info.get(
+            "title",
+            "NUTHH MP3",
+        )
+
+        files = list(
+            Path(output_dir).glob(
+                "*.mp3"
+            )
+        )
+
+        if not files:
+
+            raise RuntimeError(
+                "MP3 conversion failed."
+            )
+
+        mp3_file = max(
+            files,
+            key=lambda x:
+            x.stat().st_mtime,
+        )
+
+        return mp3_file, title
+
+
+# =========================================================
+# PROCESS DOWNLOAD
+# =========================================================
+
+async def process_download(
+    update,
+    url,
+    mode,
+):
+
+    message = update.effective_message
+
+    status = await message.reply_text(
+        "⏳ Processing..."
+    )
+
+    temp_dir = tempfile.mkdtemp(
+        prefix="nuthh_"
+    )
+
+    try:
+
+        # =================================================
+        # MP3
+        # =================================================
+
+        if mode == "mp3":
+
+            await status.edit_text(
+                "🎵 Downloading audio..."
+            )
+
+            mp3_file, title = (
+                await asyncio.to_thread(
+                    download_mp3,
+                    url,
+                    temp_dir,
+                )
+            )
+
+            size = mp3_file.stat().st_size
+
+            if size > MAX_FILE_SIZE_BYTES:
+
+                await status.edit_text(
+                    f"❌ MP3 is larger than "
+                    f"{MAX_FILE_SIZE_MB} MB."
+                )
+
+                return
+
+            await status.edit_text(
+                "🎵 MP3 ready.\n"
+                "📤 Sending..."
+            )
+
+            # Send to User
+            with open(
+                mp3_file,
+                "rb",
+            ) as audio:
+
+                await message.reply_audio(
+                    audio=audio,
+                    title=title[:64],
+                    performer="NUTHH Downloader",
+                )
+
+            # Post to all channels
+            await post_to_all_channels(
+                context=update.get_bot(),
+                mp3_file=mp3_file,
+                title=title,
+            )
+
+            await status.delete()
+
+            return
+
+        # =================================================
+        # VIDEO
+        # =================================================
+
+        await status.edit_text(
+            "🎬 Downloading video..."
+        )
+
+        video_file, title = (
+            await asyncio.to_thread(
+                download_video,
+                url,
+                temp_dir,
+            )
+        )
+
+        size = video_file.stat().st_size
+
+        if size > MAX_FILE_SIZE_BYTES:
+
+            await status.edit_text(
+                f"❌ Video is larger than "
+                f"{MAX_FILE_SIZE_MB} MB."
+            )
+
+            return
+
+        await status.edit_text(
+            "🎬 Video ready.\n"
+            "📤 Sending..."
+        )
+
+        with open(
+            video_file,
+            "rb",
+        ) as video:
+
+            await message.reply_video(
+                video=video,
+                caption=(
+                    f"🎬 {title[:900]}\n\n"
+                    "🤖 NUTHH Downloader"
+                ),
+                supports_streaming=True,
+            )
+
+        # =================================================
+        # CREATE MP3
+        # =================================================
+
+        await status.edit_text(
+            "🎵 Creating MP3..."
+        )
+
+        mp3_file, mp3_title = (
+            await asyncio.to_thread(
+                download_mp3,
+                url,
+                temp_dir,
+            )
+        )
+
+        if (
+            mp3_file.stat().st_size
+            <= MAX_FILE_SIZE_BYTES
+        ):
+
+            await status.edit_text(
+                "📢 Posting MP3 to Channels..."
+            )
+
+            await post_to_all_channels(
+                context=update.get_bot(),
+                mp3_file=mp3_file,
+                title=mp3_title,
+            )
+
+        await status.delete()
+
+    except yt_dlp.utils.DownloadError as e:
+
+        print(
+            "yt-dlp ERROR:",
+            repr(e),
+        )
+
+        await status.edit_text(
+            "❌ Download failed.\n\n"
+            "Possible reasons:\n"
+            "• Private video\n"
+            "• Login required\n"
+            "• Unsupported URL\n"
+            "• Platform changed\n"
+            "• Network problem"
+        )
+
+    except Exception as e:
+
+        print(
+            "DOWNLOAD ERROR:",
+            repr(e),
+        )
+
+        await status.edit_text(
+            "❌ Error\n\n"
+            f"`{str(e)[:700]}`",
+            parse_mode="Markdown",
+        )
+
+    finally:
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+
+# =========================================================
+# POST MP3 TO ALL CHANNELS
+# =========================================================
+
+async def post_to_all_channels(
+    context,
+    mp3_file,
+    title,
+):
+
+    channels = get_channels()
+
+    if not channels:
+
+        print(
+            "No channels configured."
+        )
+
+        return
+
+    success_count = 0
+
+    for channel in channels:
+
+        username = channel["username"]
+
+        try:
+
+            with open(
+                mp3_file,
+                "rb",
+            ) as audio:
+
+                await context.bot.send_audio(
+                    chat_id=username,
+                    audio=audio,
+                    title=title[:64],
+                    performer="NUTHH Downloader",
+                    caption=(
+                        "🎵 New MP3\n\n"
+                        f"🎧 {title[:800]}\n\n"
+                        "🤖 NUTHH Downloader"
+                    ),
+                )
+
+            success_count += 1
+
+            print(
+                f"✅ Posted to {username}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"❌ Failed {username}:",
+                repr(e),
+            )
+
+    print(
+        f"Channel result: "
+        f"{success_count}/{len(channels)}"
     )
 
 
-# =========================
+# =========================================================
+# /genkey
+# =========================================================
+
+async def genkey_command(
+    update,
+    context,
+):
+
+    user_id = update.effective_user.id
+
+    if user_id != MAIN_OWNER_ID:
+
+        await update.message.reply_text(
+            "❌ Main Owner only."
+        )
+
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "/genkey 1d\n"
+            "/genkey 7d\n"
+            "/genkey 30d\n"
+            "/genkey 90d\n"
+            "/genkey 1y\n"
+            "/genkey lifetime"
+        )
+
+        return
+
+    duration = context.args[0]
+
+    try:
+
+        expires_at = calculate_expiry(
+            duration
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ Invalid duration."
+        )
+
+        return
+
+    key = generate_key()
+
+    create_license(
+        key,
+        expires_at,
+    )
+
+    await update.message.reply_text(
+        "✅ License Created\n\n"
+        f"🔑 `{key}`\n"
+        f"⏳ {duration}\n"
+        f"📅 {format_expiry(expires_at)}",
+        parse_mode="Markdown",
+    )
+
+
+# =========================================================
+# ERROR
+# =========================================================
+
+async def error_handler(
+    update,
+    context,
+):
+
+    print(
+        "BOT ERROR:",
+        repr(context.error),
+    )
+
+
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN is missing. Add it to Railway Variables."
-        )
 
-    if MAIN_OWNER_ID == 0:
-        raise RuntimeError(
-            "OWNER_ID is missing. Add your Telegram User ID."
-        )
-
-    init_db()
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-
-    app.add_handler(
-        CallbackQueryHandler(callback_handler)
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
     )
 
-    app.add_handler(
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "genkey",
+            genkey_command,
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message
+            filters.TEXT
+            & ~filters.COMMAND,
+            text_handler,
         )
     )
 
-    print("NUTHH BOT is running...")
+    application.add_error_handler(
+        error_handler
+    )
 
-    app.run_polling()
+    print(
+        "================================"
+    )
+
+    print(
+        " NUTHH Multi-Channel Downloader"
+    )
+
+    print(
+        " Status: RUNNING"
+    )
+
+    print(
+        "================================"
+    )
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
