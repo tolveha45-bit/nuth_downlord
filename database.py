@@ -1,4 +1,3 @@
-```python
 import sqlite3
 from datetime import datetime, timezone
 
@@ -176,4 +175,3 @@ def list_licenses():
             ORDER BY id DESC
             """
         ).fetchall()
-```
