@@ -1,4 +1,3 @@
-```python
 import secrets
 import string
 from datetime import datetime, timedelta, timezone
@@ -54,4 +53,3 @@ def format_expiry(expires_at):
     return dt.astimezone().strftime(
         "%d/%m/%Y %H:%M"
     )
-```
