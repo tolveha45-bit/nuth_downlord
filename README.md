@@ -136,3 +136,24 @@ Never upload BOT_TOKEN to GitHub.
 
 If the token is exposed, revoke it through
 BotFather and generate a new token.
+User/Owner
+   ↓
+🔑 Activate Key
+   ↓
+License OK
+   ↓
+📥 Download
+   ↓
+YouTube/TikTok URL
+   ↓
+🔎 Bot checks available qualities
+   ↓
+┌───────────────────────┐
+│ 🎬 4K (2160p)         │
+│ 🎬 2K (1440p)         │
+│ 🎬 1080p              │
+│ 🎬 720p               │
+│ 🏆 Best Available     │
+└───────────────────────┘
+   ↓
+Download + MP4
