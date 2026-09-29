@@ -1,5 +1,3 @@
-# downloader.py
-
 import asyncio
 import shutil
 import uuid
