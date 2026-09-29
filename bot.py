@@ -1,8 +1,4 @@
-import os
 import re
-import asyncio
-
-from pathlib import Path
 
 from telegram import (
     Update,
@@ -23,6 +19,7 @@ from config import (
     BOT_TOKEN,
     MAIN_OWNER_ID,
     MAX_FILE_SIZE,
+    DOWNLOAD_DIR,
     validate_config,
 )
 
@@ -62,111 +59,91 @@ from downloader import (
     download_mp3,
     is_file_too_large,
     cleanup_folder,
+    get_video_info,
+    get_available_qualities,
 )
 
 
-# ==================================================
-# SESSION STORAGE
-# ==================================================
+# =========================================================
+# SESSION DATA
+# =========================================================
 
-# Important:
-# RAM only.
-# Bot restart = users must activate their key again.
-
+# user_id -> license key
 ACTIVE_SESSIONS = {}
 
+# user_id -> current state
 USER_STATES = {}
 
+# user_id -> URL waiting for quality selection
+PENDING_URLS = {}
 
-# ==================================================
-# MAIN OWNER
-# ==================================================
 
-def is_main_owner(user_id):
+# =========================================================
+# ROLE
+# =========================================================
 
+def is_main_owner(user_id: int) -> bool:
     return user_id == MAIN_OWNER_ID
 
 
-def is_owner(user_id):
-
-    if user_id == MAIN_OWNER_ID:
-        return True
-
-    return get_user_role(user_id) == "owner"
-
-
-# ==================================================
-# SESSION LICENSE
-# ==================================================
-
-def get_session_license(
-    user_id
-):
-
-    key = ACTIVE_SESSIONS.get(
-        user_id
+def is_owner(user_id: int) -> bool:
+    return (
+        user_id == MAIN_OWNER_ID
+        or get_user_role(user_id) == "owner"
     )
+
+
+# =========================================================
+# LICENSE SESSION
+# =========================================================
+
+def get_session_license(user_id: int):
+
+    key = ACTIVE_SESSIONS.get(user_id)
 
     if not key:
         return None
 
-    key = normalize_license_key(
-        key
-    )
+    key = normalize_license_key(key)
 
-    data = get_license(
-        key
-    )
+    row = get_license(key)
 
-    if not data:
+    if not row:
+        ACTIVE_SESSIONS.pop(user_id, None)
+        return None
+
+    if row["status"] != "active":
+        ACTIVE_SESSIONS.pop(user_id, None)
+        return None
+
+    if is_expired(row["expires_at"]):
 
         ACTIVE_SESSIONS.pop(
             user_id,
             None
         )
-
-        return None
-
-    if data["status"] != "active":
-
-        ACTIVE_SESSIONS.pop(
-            user_id,
-            None
-        )
-
-        return None
-
-    if is_expired(
-        data["expires_at"]
-    ):
 
         revoke_license(key)
 
-        ACTIVE_SESSIONS.pop(
-            user_id,
-            None
-        )
-
         return None
 
-    return data
+    return row
 
 
-# ==================================================
-# KEYBOARDS
-# ==================================================
+# =========================================================
+# MAIN MENU
+# =========================================================
 
-def main_menu(
-    user_id
-):
+def main_menu(user_id: int):
 
-    buttons = [
+    keyboard = [
 
         [
             InlineKeyboardButton(
                 "🔑 Activate Key",
                 callback_data="activate"
             ),
+
             InlineKeyboardButton(
                 "📋 My License",
                 callback_data="my_license"
@@ -178,6 +155,7 @@ def main_menu(
                 "📥 Download",
                 callback_data="download"
             ),
+
             InlineKeyboardButton(
                 "🎵 MP3",
                 callback_data="mp3"
@@ -189,6 +167,7 @@ def main_menu(
                 "🆔 My ID",
                 callback_data="my_id"
             ),
+
             InlineKeyboardButton(
                 "ℹ️ Help",
                 callback_data="help"
@@ -198,17 +177,21 @@ def main_menu(
 
     if is_owner(user_id):
 
-        buttons.append([
-            InlineKeyboardButton(
-                "👑 Owner Panel",
-                callback_data="owner_panel"
-            )
-        ])
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "👑 Owner Panel",
+                    callback_data="owner_panel"
+                )
+            ]
+        )
 
-    return InlineKeyboardMarkup(
-        buttons
-    )
+    return InlineKeyboardMarkup(keyboard)
 
+
+# =========================================================
+# OWNER MENU
+# =========================================================
 
 def owner_menu():
 
@@ -217,32 +200,35 @@ def owner_menu():
         [
             InlineKeyboardButton(
                 "➕ Generate Key",
-                callback_data="gen_key"
+                callback_data="gen"
             ),
+
             InlineKeyboardButton(
                 "📋 All Keys",
-                callback_data="all_keys"
+                callback_data="keys"
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "🔍 Key Info",
-                callback_data="key_info"
+                callback_data="keyinfo"
             ),
+
             InlineKeyboardButton(
-                "🚫 Revoke",
+                "🚫 Revoke Key",
                 callback_data="revoke"
             ),
         ],
 
         [
             InlineKeyboardButton(
-                "♻️ Restore",
+                "♻️ Restore Key",
                 callback_data="restore"
             ),
+
             InlineKeyboardButton(
-                "🗑 Delete",
+                "🗑 Delete Key",
                 callback_data="delete"
             ),
         ],
@@ -252,6 +238,7 @@ def owner_menu():
                 "👥 Users",
                 callback_data="users"
             ),
+
             InlineKeyboardButton(
                 "📊 Statistics",
                 callback_data="stats"
@@ -263,27 +250,29 @@ def owner_menu():
                 "📢 Channels",
                 callback_data="channels"
             ),
+
+            InlineKeyboardButton(
+                "➕ Add Channel",
+                callback_data="addchannel"
+            ),
         ],
 
         [
             InlineKeyboardButton(
-                "➕ Add Channel",
-                callback_data="add_channel"
-            ),
-            InlineKeyboardButton(
                 "🗑 Remove Channel",
-                callback_data="remove_channel"
+                callback_data="removechannel"
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "👑 Set Owner",
-                callback_data="set_owner"
+                callback_data="setowner"
             ),
+
             InlineKeyboardButton(
                 "👤 Set User",
-                callback_data="set_user"
+                callback_data="setuser"
             ),
         ],
 
@@ -291,15 +280,104 @@ def owner_menu():
             InlineKeyboardButton(
                 "⬅️ Back",
                 callback_data="back"
-            ),
+            )
         ],
-
     ])
 
 
-# ==================================================
+# =========================================================
+# QUALITY MENU
+# =========================================================
+
+def quality_menu_from_available(available):
+
+    buttons = []
+
+    row = []
+
+    qualities = [
+
+        (
+            "4k",
+            "🎬 4K (2160p)"
+        ),
+
+        (
+            "2k",
+            "🎬 2K (1440p)"
+        ),
+
+        (
+            "1080p",
+            "🎬 1080p"
+        ),
+
+        (
+            "720p",
+            "🎬 720p"
+        ),
+    ]
+
+    for quality, label in qualities:
+
+        if available.get(quality):
+
+            row.append(
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"quality:{quality}"
+                )
+            )
+
+            if len(row) == 2:
+
+                buttons.append(row)
+
+                row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "🏆 Best Available",
+                callback_data="quality:best"
+            )
+        ]
+    )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="cancel"
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(buttons)
+
+
+# =========================================================
+# CANCEL MENU
+# =========================================================
+
+def cancel_menu():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="cancel"
+            )
+        ]
+    ])
+
+
+# =========================================================
 # START
-# ==================================================
+# =========================================================
 
 async def start(
     update: Update,
@@ -314,75 +392,139 @@ async def start(
         user.first_name
     )
 
+    USER_STATES.pop(
+        user.id,
+        None
+    )
+
+    PENDING_URLS.pop(
+        user.id,
+        None
+    )
+
     await update.message.reply_text(
-
-        "👋 Welcome to NUTHH’ Downloader!\n\n"
-
-        "🎬 YouTube\n"
-        "🎵 TikTok\n"
-        "🎧 MP3\n"
-        "🔑 License System\n"
-        "📢 Multi Channel\n\n"
-
-        "Please activate your license first.",
-
-        reply_markup=main_menu(
-            user.id
-        )
+        "hello\n\n"
+        "🤖 Welcome to NUTHH’ Downloader\n\n"
+        "Choose an option below:",
+        reply_markup=main_menu(user.id)
     )
 
 
-# ==================================================
-# HELP
-# ==================================================
+# =========================================================
+# ACTIVATE LICENSE
+# =========================================================
 
-async def show_help(
-    update,
-    context
+async def activate_key_for_user(
+    user_id: int,
+    raw_key: str
 ):
 
-    text = (
-        "ℹ️ NUTHH’ Downloader Help\n\n"
-
-        "1️⃣ Activate your license.\n"
-        "2️⃣ Press 📥 Download or 🎵 MP3.\n"
-        "3️⃣ Send YouTube/TikTok URL.\n\n"
-
-        "Supported:\n"
-        "• YouTube\n"
-        "• YouTube Shorts\n"
-        "• TikTok\n\n"
-
-        "🔑 One activated key allows "
-        "unlimited downloads during "
-        "the current bot session.\n\n"
-
-        "🔄 After bot restart, "
-        "activate your key again."
+    key = normalize_license_key(
+        raw_key
     )
 
-    if update.callback_query:
+    if not is_valid_key_format(key):
 
-        await update.callback_query.message.reply_text(
-            text,
-            reply_markup=main_menu(
-                update.effective_user.id
-            )
+        return (
+            False,
+            "❌ Invalid license key format."
         )
 
-    else:
+    row = get_license(key)
+
+    if not row:
+
+        return (
+            False,
+            "❌ License key not found."
+        )
+
+    if row["status"] != "active":
+
+        return (
+            False,
+            f"❌ This key is {row['status']}."
+        )
+
+    if is_expired(
+        row["expires_at"]
+    ):
+
+        revoke_license(key)
+
+        return (
+            False,
+            "❌ This license has expired."
+        )
+
+    ACTIVE_SESSIONS[user_id] = key
+
+    activate_license(
+        key,
+        user_id
+    )
+
+    return (
+        True,
+        "✅ License Activated!\n\n"
+        f"🔑 `{key}`\n"
+        f"⏳ Remaining: "
+        f"{remaining_time(row['expires_at'])}\n"
+        f"📅 Expires: "
+        f"{format_expiry(row['expires_at'])}"
+    )
+
+
+# =========================================================
+# /ACTIVATE COMMAND
+# =========================================================
+
+async def activate_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    ensure_user(
+        user.id,
+        user.username,
+        user.first_name
+    )
+
+    if not context.args:
+
+        USER_STATES[user.id] = "activate"
 
         await update.message.reply_text(
-            text,
-            reply_markup=main_menu(
-                update.effective_user.id
-            )
+            "🔑 Please send your license key.\n\n"
+            "Example:\n"
+            "`NUTHH-AB12-CD34-EF56`",
+            parse_mode="Markdown",
+            reply_markup=cancel_menu()
         )
 
+        return
 
-# ==================================================
-# CALLBACK
-# ==================================================
+    raw_key = " ".join(
+        context.args
+    )
+
+    success, message = await activate_key_for_user(
+        user.id,
+        raw_key
+    )
+
+    await update.message.reply_text(
+        message,
+        parse_mode="Markdown",
+        reply_markup=main_menu(user.id)
+    )
+
+
+# =========================================================
+# CALLBACK HANDLER
+# =========================================================
 
 async def callback_handler(
     update: Update,
@@ -403,522 +545,717 @@ async def callback_handler(
 
     data = query.data
 
-    # ----------------------------
-    # Activate
-    # ----------------------------
+
+    # =====================================================
+    # CANCEL
+    # =====================================================
+
+    if data == "cancel":
+
+        USER_STATES.pop(
+            user.id,
+            None
+        )
+
+        PENDING_URLS.pop(
+            user.id,
+            None
+        )
+
+        await query.edit_message_text(
+            "❌ Cancelled.",
+            reply_markup=main_menu(user.id)
+        )
+
+        return
+
+
+    # =====================================================
+    # BACK
+    # =====================================================
+
+    if data == "back":
+
+        USER_STATES.pop(
+            user.id,
+            None
+        )
+
+        await query.edit_message_text(
+            "🏠 Main Menu",
+            reply_markup=main_menu(user.id)
+        )
+
+        return
+
+
+    # =====================================================
+    # ACTIVATE KEY
+    # =====================================================
 
     if data == "activate":
 
         USER_STATES[user.id] = "activate"
 
-        await query.message.reply_text(
-            "🔑 Send your license key.\n\n"
+        await query.edit_message_text(
+            "🔑 Activate License\n\n"
+            "Send your license key.\n\n"
             "Example:\n"
-            "`NUTHH-AB12-CD34-EF56`\n\n"
-            "Lowercase and spaces are accepted.",
-            parse_mode="Markdown"
+            "`NUTHH-AB12-CD34-EF56`",
+            parse_mode="Markdown",
+            reply_markup=cancel_menu()
         )
 
         return
 
-    # ----------------------------
-    # My License
-    # ----------------------------
+
+    # =====================================================
+    # MY LICENSE
+    # =====================================================
 
     if data == "my_license":
 
-        license_data = get_session_license(
+        license_row = get_session_license(
             user.id
         )
 
-        if not license_data:
+        if not license_row:
 
-            await query.message.reply_text(
-                "❌ No active license session.\n\n"
-                "Please activate your key.",
-                reply_markup=main_menu(
-                    user.id
-                )
+            text = (
+                "📋 My License\n\n"
+                "❌ No active license.\n\n"
+                "Press 🔑 Activate Key."
             )
 
-            return
+        else:
 
-        await query.message.reply_text(
+            text = (
+                "📋 My License\n\n"
+                f"🔑 `{license_row['license_key']}`\n\n"
+                f"📌 Status: "
+                f"{license_row['status']}\n"
+                f"⏳ Remaining: "
+                f"{remaining_time(license_row['expires_at'])}\n"
+                f"📅 Expires: "
+                f"{format_expiry(license_row['expires_at'])}"
+            )
 
-            "📋 Your License\n\n"
-
-            f"🔑 `{license_data['license_key']}`\n"
-            f"📌 Status: `{license_data['status']}`\n"
-            f"⏳ Expires: "
-            f"{format_expiry(license_data['expires_at'])}\n"
-            f"🕐 Remaining: "
-            f"{remaining_time(license_data['expires_at'])}\n\n"
-
-            "♾️ Downloads: Unlimited",
-
-            parse_mode="Markdown"
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=main_menu(user.id)
         )
 
         return
 
-    # ----------------------------
-    # Download
-    # ----------------------------
+
+    # =====================================================
+    # DOWNLOAD
+    # =====================================================
 
     if data == "download":
 
-        if not get_session_license(user.id):
+        license_row = get_session_license(
+            user.id
+        )
 
-            await query.message.reply_text(
-                "🔒 License required.\n\n"
-                "Please activate your key first."
+        if not license_row:
+
+            await query.edit_message_text(
+                "❌ You need an active license first.\n\n"
+                "Press 🔑 Activate Key.",
+                reply_markup=main_menu(user.id)
             )
 
             return
 
-        USER_STATES[user.id] = "video"
+        USER_STATES[user.id] = "video_url"
 
-        await query.message.reply_text(
-            "📥 Send a YouTube or TikTok URL."
+        await query.edit_message_text(
+            "📥 Video Download\n\n"
+            "Send your YouTube or TikTok URL.",
+            reply_markup=cancel_menu()
         )
 
         return
 
-    # ----------------------------
+
+    # =====================================================
     # MP3
-    # ----------------------------
+    # =====================================================
 
     if data == "mp3":
 
-        if not get_session_license(user.id):
+        license_row = get_session_license(
+            user.id
+        )
 
-            await query.message.reply_text(
-                "🔒 License required.\n\n"
-                "Please activate your key first."
+        if not license_row:
+
+            await query.edit_message_text(
+                "❌ You need an active license first.\n\n"
+                "Press 🔑 Activate Key.",
+                reply_markup=main_menu(user.id)
             )
 
             return
 
         USER_STATES[user.id] = "mp3"
 
-        await query.message.reply_text(
-            "🎵 Send a YouTube or TikTok URL."
+        await query.edit_message_text(
+            "🎵 MP3 Download\n\n"
+            "Send your YouTube or TikTok URL.",
+            reply_markup=cancel_menu()
         )
 
         return
 
-    # ----------------------------
-    # My ID
-    # ----------------------------
+
+    # =====================================================
+    # MY ID
+    # =====================================================
 
     if data == "my_id":
 
-        await query.message.reply_text(
-            f"🆔 Your Telegram ID:\n\n"
+        await query.edit_message_text(
+            "🆔 Your Telegram ID:\n\n"
             f"`{user.id}`",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=main_menu(user.id)
         )
 
         return
 
-    # ----------------------------
-    # Help
-    # ----------------------------
+
+    # =====================================================
+    # HELP
+    # =====================================================
 
     if data == "help":
 
-        await show_help(
-            update,
-            context
+        text = (
+            "ℹ️ NUTHH’ Downloader Help\n\n"
+
+            "🔑 Activate Key\n"
+            "Activate your license.\n\n"
+
+            "📥 Download\n"
+            "Download YouTube/TikTok video.\n\n"
+
+            "🎬 Video Quality\n"
+            "• 4K 2160p\n"
+            "• 2K 1440p\n"
+            "• 1080p\n"
+            "• 720p\n"
+            "• Best Available\n\n"
+
+            "🎵 MP3\n"
+            "Download audio as MP3 192kbps.\n\n"
+
+            "⚠️ Important\n"
+            "Owner also needs an active license "
+            "before downloading."
+        )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=main_menu(user.id)
         )
 
         return
 
-    # ----------------------------
-    # Owner Panel
-    # ----------------------------
+
+    # =====================================================
+    # OWNER PANEL
+    # =====================================================
 
     if data == "owner_panel":
 
         if not is_owner(user.id):
 
-            await query.message.reply_text(
-                "❌ Owner access required."
+            await query.answer(
+                "Owner only.",
+                show_alert=True
             )
 
             return
 
-        await query.message.reply_text(
-            "👑 NUTHH’ Owner Panel",
+        await query.edit_message_text(
+            "👑 Owner Panel",
             reply_markup=owner_menu()
         )
 
         return
 
-    # ----------------------------
-    # Back
-    # ----------------------------
 
-    if data == "back":
+    # =====================================================
+    # QUALITY SELECTION
+    # =====================================================
 
-        await query.message.reply_text(
-            "🏠 Main Menu",
-            reply_markup=main_menu(
-                user.id
+    if data.startswith("quality:"):
+
+        quality = data.split(
+            ":",
+            1
+        )[1]
+
+        url = PENDING_URLS.get(
+            user.id
+        )
+
+        if not url:
+
+            await query.edit_message_text(
+                "❌ Download session expired.",
+                reply_markup=main_menu(user.id)
             )
+
+            return
+
+        if not get_session_license(
+            user.id
+        ):
+
+            await query.edit_message_text(
+                "❌ Your license is no longer active.",
+                reply_markup=main_menu(user.id)
+            )
+
+            return
+
+        USER_STATES.pop(
+            user.id,
+            None
+        )
+
+        PENDING_URLS.pop(
+            user.id,
+            None
+        )
+
+        quality_names = {
+            "4k": "4K (2160p)",
+            "2k": "2K (1440p)",
+            "1080p": "1080p",
+            "720p": "720p",
+            "best": "Best Available",
+        }
+
+        quality_name = quality_names.get(
+            quality,
+            quality
+        )
+
+        await query.edit_message_text(
+            f"⏳ Downloading...\n\n"
+            f"🎬 Quality: {quality_name}\n\n"
+            "Please wait."
+        )
+
+        folder = create_temp_dir(
+            str(DOWNLOAD_DIR)
+        )
+
+        try:
+
+            file_path = await download_video(
+                url,
+                folder,
+                quality
+            )
+
+            if is_file_too_large(
+                file_path,
+                MAX_FILE_SIZE
+            ):
+
+                await query.message.reply_text(
+                    "❌ File is too large for "
+                    "the configured Telegram upload limit."
+                )
+
+                return
+
+            with file_path.open(
+                "rb"
+            ) as video:
+
+                await query.message.reply_video(
+                    video=video,
+                    caption=(
+                        "🎬 NUTHH’ Downloader\n\n"
+                        f"Quality: {quality_name}"
+                    ),
+                    supports_streaming=True
+                )
+
+        except Exception as error:
+
+            await query.message.reply_text(
+                "❌ Download failed.\n\n"
+                f"{str(error)[:1500]}"
+            )
+
+        finally:
+
+            cleanup_folder(
+                folder
+            )
+
+        return
+
+
+    # =====================================================
+    # OWNER CHECK
+    # =====================================================
+
+    if not is_owner(user.id):
+
+        await query.answer(
+            "Owner only.",
+            show_alert=True
         )
 
         return
 
-    # ----------------------------
-    # Generate Key
-    # ----------------------------
 
-    if data == "gen_key":
+    # =====================================================
+    # GENERATE KEY
+    # =====================================================
 
-        if not is_owner(user.id):
+    if data == "gen":
 
-            return
+        await query.edit_message_text(
+            "➕ Generate License Key\n\n"
+            "Choose duration:",
+            reply_markup=InlineKeyboardMarkup([
 
-        USER_STATES[user.id] = "gen_key"
+                [
+                    InlineKeyboardButton(
+                        "1 Day",
+                        callback_data="gend:1d"
+                    ),
 
-        await query.message.reply_text(
+                    InlineKeyboardButton(
+                        "7 Days",
+                        callback_data="gend:7d"
+                    ),
+                ],
 
-            "➕ Generate License\n\n"
+                [
+                    InlineKeyboardButton(
+                        "30 Days",
+                        callback_data="gend:30d"
+                    ),
 
-            "Send duration:\n\n"
+                    InlineKeyboardButton(
+                        "90 Days",
+                        callback_data="gend:90d"
+                    ),
+                ],
 
-            "`1d`\n"
-            "`7d`\n"
-            "`30d`\n"
-            "`90d`\n"
-            "`1y`\n"
-            "`lifetime`",
+                [
+                    InlineKeyboardButton(
+                        "1 Year",
+                        callback_data="gend:1y"
+                    ),
 
-            parse_mode="Markdown"
+                    InlineKeyboardButton(
+                        "Lifetime",
+                        callback_data="gend:lifetime"
+                    ),
+                ],
+
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="owner_panel"
+                    )
+                ],
+
+            ])
         )
 
         return
 
-    # ----------------------------
-    # All Keys
-    # ----------------------------
 
-    if data == "all_keys":
+    # =====================================================
+    # GENERATE KEY RESULT
+    # =====================================================
 
-        if not is_owner(user.id):
+    if data.startswith("gend:"):
 
-            return
+        duration = data.split(
+            ":",
+            1
+        )[1]
+
+        key = generate_key()
+
+        expires_at = calculate_expiry(
+            duration
+        )
+
+        create_license(
+            key,
+            expires_at,
+            user.id
+        )
+
+        await query.edit_message_text(
+            "🔑 NEW LICENSE KEY\n\n"
+
+            f"`{key}`\n\n"
+
+            f"⏳ Duration: {duration}\n"
+
+            f"📅 Expires: "
+            f"{format_expiry(expires_at)}\n\n"
+
+            "⚠️ Owner must activate this key "
+            "before downloading.",
+            parse_mode="Markdown",
+            reply_markup=owner_menu()
+        )
+
+        return
+
+
+    # =====================================================
+    # ALL KEYS
+    # =====================================================
+
+    if data == "keys":
 
         rows = list_licenses()
 
         if not rows:
 
-            await query.message.reply_text(
-                "📋 No licenses found."
+            text = (
+                "📋 All Keys\n\n"
+                "No licenses found."
             )
 
-            return
+        else:
 
-        text = "📋 LICENSES\n\n"
+            parts = [
+                "📋 ALL LICENSES\n"
+            ]
 
-        for row in rows[:50]:
+            for row in rows[:50]:
 
-            text += (
-                f"🔑 `{row['license_key']}`\n"
-                f"📌 {row['status']}\n"
-                f"⏳ "
-                f"{format_expiry(row['expires_at'])}\n\n"
-            )
+                parts.append(
+                    f"🔑 `{row['license_key']}`\n"
+                    f"📌 {row['status']}\n"
+                    f"⏳ {remaining_time(row['expires_at'])}\n"
+                )
 
-        await query.message.reply_text(
+            text = "\n".join(parts)
+
+        await query.edit_message_text(
             text,
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=owner_menu()
         )
 
         return
 
-    # ----------------------------
-    # Key Info
-    # ----------------------------
 
-    if data == "key_info":
-
-        if not is_owner(user.id):
-
-            return
-
-        USER_STATES[user.id] = "key_info"
-
-        await query.message.reply_text(
-            "🔍 Send license key."
-        )
-
-        return
-
-    # ----------------------------
-    # Revoke
-    # ----------------------------
-
-    if data == "revoke":
-
-        if not is_main_owner(user.id):
-
-            await query.message.reply_text(
-                "🔒 Main Owner only."
-            )
-
-            return
-
-        USER_STATES[user.id] = "revoke"
-
-        await query.message.reply_text(
-            "🚫 Send license key to revoke."
-        )
-
-        return
-
-    # ----------------------------
-    # Restore
-    # ----------------------------
-
-    if data == "restore":
-
-        if not is_main_owner(user.id):
-
-            await query.message.reply_text(
-                "🔒 Main Owner only."
-            )
-
-            return
-
-        USER_STATES[user.id] = "restore"
-
-        await query.message.reply_text(
-            "♻️ Send revoked license key."
-        )
-
-        return
-
-    # ----------------------------
-    # Delete
-    # ----------------------------
-
-    if data == "delete":
-
-        if not is_main_owner(user.id):
-
-            await query.message.reply_text(
-                "🔒 Main Owner only."
-            )
-
-            return
-
-        USER_STATES[user.id] = "delete"
-
-        await query.message.reply_text(
-            "🗑 Send license key to delete."
-        )
-
-        return
-
-    # ----------------------------
-    # Users
-    # ----------------------------
+    # =====================================================
+    # USERS
+    # =====================================================
 
     if data == "users":
 
-        if not is_owner(user.id):
-
-            return
-
         rows = list_users()
 
-        text = "👥 USERS\n\n"
+        if not rows:
 
-        for row in rows[:50]:
+            text = "👥 No users."
 
-            username = (
-                f"@{row['username']}"
-                if row["username"]
-                else "No username"
-            )
+        else:
 
-            text += (
-                f"🆔 `{row['user_id']}`\n"
-                f"👤 {username}\n"
-                f"👑 {row['role']}\n\n"
-            )
+            parts = [
+                "👥 USERS\n"
+            ]
 
-        await query.message.reply_text(
+            for row in rows[:50]:
+
+                username = (
+                    f"@{row['username']}"
+                    if row["username"]
+                    else "-"
+                )
+
+                parts.append(
+                    f"🆔 {row['user_id']}\n"
+                    f"👤 {username}\n"
+                    f"👑 Role: {row['role']}\n"
+                )
+
+            text = "\n".join(parts)
+
+        await query.edit_message_text(
             text,
-            parse_mode="Markdown"
+            reply_markup=owner_menu()
         )
 
         return
 
-    # ----------------------------
-    # Statistics
-    # ----------------------------
+
+    # =====================================================
+    # STATISTICS
+    # =====================================================
 
     if data == "stats":
 
-        if not is_owner(user.id):
-
-            return
-
         stats = get_statistics()
 
-        await query.message.reply_text(
-
-            "📊 NUTHH’ STATISTICS\n\n"
+        text = (
+            "📊 STATISTICS\n\n"
 
             f"👥 Users: "
             f"{stats['users']}\n"
 
-            f"🔑 Total Keys: "
+            f"🔑 Licenses: "
             f"{stats['licenses']}\n"
 
-            f"✅ Active Keys: "
+            f"✅ Active Licenses: "
             f"{stats['active_licenses']}\n"
 
             f"📢 Channels: "
-            f"{stats['channels']}\n\n"
+            f"{stats['channels']}"
+        )
 
-            f"🟢 Active Sessions: "
-            f"{len(ACTIVE_SESSIONS)}"
+        await query.edit_message_text(
+            text,
+            reply_markup=owner_menu()
         )
 
         return
 
-    # ----------------------------
-    # Channels
-    # ----------------------------
+
+    # =====================================================
+    # CHANNELS
+    # =====================================================
 
     if data == "channels":
-
-        if not is_owner(user.id):
-
-            return
 
         rows = get_channels()
 
         if not rows:
 
-            await query.message.reply_text(
-                "📢 No channels configured."
+            text = (
+                "📢 CHANNELS\n\n"
+                "No channels configured."
             )
 
-            return
+        else:
 
-        text = "📢 CHANNELS\n\n"
+            parts = [
+                "📢 CHANNELS\n"
+            ]
 
-        for row in rows:
+            for index, row in enumerate(
+                rows,
+                start=1
+            ):
 
-            text += (
-                f"• `{row['username']}`\n"
-            )
+                parts.append(
+                    f"{index}. "
+                    f"{row['username']}"
+                )
 
-        await query.message.reply_text(
+            text = "\n".join(parts)
+
+        await query.edit_message_text(
             text,
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # ----------------------------
-    # Add Channel
-    # ----------------------------
-
-    if data == "add_channel":
-
-        if not is_owner(user.id):
-
-            return
-
-        USER_STATES[user.id] = "add_channel"
-
-        await query.message.reply_text(
-
-            "➕ Send public channel username.\n\n"
-
-            "Example:\n"
-            "`@music_khmer`\n\n"
-
-            "The bot must be Administrator "
-            "with Post Messages permission.",
-
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # ----------------------------
-    # Remove Channel
-    # ----------------------------
-
-    if data == "remove_channel":
-
-        if not is_owner(user.id):
-
-            return
-
-        USER_STATES[user.id] = "remove_channel"
-
-        await query.message.reply_text(
-            "🗑 Send channel username."
-        )
-
-        return
-
-    # ----------------------------
-    # Set Owner
-    # ----------------------------
-
-    if data == "set_owner":
-
-        if not is_main_owner(user.id):
-
-            await query.message.reply_text(
-                "🔒 Main Owner only."
-            )
-
-            return
-
-        USER_STATES[user.id] = "set_owner"
-
-        await query.message.reply_text(
-            "👑 Send Telegram User ID."
-        )
-
-        return
-
-    # ----------------------------
-    # Set User
-    # ----------------------------
-
-    if data == "set_user":
-
-        if not is_main_owner(user.id):
-
-            await query.message.reply_text(
-                "🔒 Main Owner only."
-            )
-
-            return
-
-        USER_STATES[user.id] = "set_user"
-
-        await query.message.reply_text(
-            "👤 Send Telegram User ID."
+            reply_markup=owner_menu()
         )
 
         return
 
 
-# ==================================================
-# MESSAGE HANDLER
-# ==================================================
+    # =====================================================
+    # OWNER-ONLY STATES
+    # =====================================================
+
+    owner_actions = {
+        "keyinfo": "keyinfo",
+        "revoke": "revoke",
+        "restore": "restore",
+        "delete": "delete",
+        "addchannel": "addchannel",
+        "removechannel": "removechannel",
+        "setowner": "setowner",
+        "setuser": "setuser",
+    }
+
+    if data in owner_actions:
+
+        action = owner_actions[data]
+
+        if action in (
+            "revoke",
+            "restore",
+            "delete",
+            "setowner",
+            "setuser",
+        ):
+
+            if not is_main_owner(
+                user.id
+            ):
+
+                await query.answer(
+                    "Main Owner only.",
+                    show_alert=True
+                )
+
+                return
+
+        USER_STATES[user.id] = action
+
+        prompts = {
+
+            "keyinfo":
+                "🔍 Send license key:",
+
+            "revoke":
+                "🚫 Send license key to revoke:",
+
+            "restore":
+                "♻️ Send license key to restore:",
+
+            "delete":
+                "🗑 Send license key to delete:",
+
+            "addchannel":
+                "➕ Send public channel username.\n\n"
+                "Example:\n"
+                "@music_khmer",
+
+            "removechannel":
+                "🗑 Send channel username to remove:",
+
+            "setowner":
+                "👑 Send Telegram User ID:",
+
+            "setuser":
+                "👤 Send Telegram User ID:",
+        }
+
+        await query.edit_message_text(
+            prompts[action],
+            reply_markup=cancel_menu()
+        )
+
+        return
+
+
+# =========================================================
+# TEXT HANDLER
+# =========================================================
 
 async def text_handler(
     update: Update,
@@ -927,11 +1264,9 @@ async def text_handler(
 
     user = update.effective_user
 
-    if not user:
-        return
-
     text = (
-        update.message.text or ""
+        update.message.text
+        or ""
     ).strip()
 
     ensure_user(
@@ -944,561 +1279,78 @@ async def text_handler(
         user.id
     )
 
-    # ==================================================
-    # ACTIVATE KEY
-    # ==================================================
+
+    # =====================================================
+    # AUTO DETECT LICENSE KEY
+    # =====================================================
+
+    possible_key = normalize_license_key(
+        text
+    )
+
+    if is_valid_key_format(
+        possible_key
+    ):
+
+        success, message = await activate_key_for_user(
+            user.id,
+            possible_key
+        )
+
+        USER_STATES.pop(
+            user.id,
+            None
+        )
+
+        await update.message.reply_text(
+            message,
+            parse_mode="Markdown",
+            reply_markup=main_menu(user.id)
+        )
+
+        return
+
+
+    # =====================================================
+    # ACTIVATE STATE
+    # =====================================================
 
     if state == "activate":
 
-        key = normalize_license_key(
+        success, message = await activate_key_for_user(
+            user.id,
             text
         )
 
-        # Format check
-        if not is_valid_key_format(key):
+        if success:
 
-            await update.message.reply_text(
-
-                "❌ Invalid license format.\n\n"
-
-                "Example:\n"
-                "`NUTHH-AB12-CD34-EF56`\n\n"
-
-                "Spaces and lowercase are accepted.",
-
-                parse_mode="Markdown"
+            USER_STATES.pop(
+                user.id,
+                None
             )
-
-            return
-
-        license_data = get_license(
-            key
-        )
-
-        if not license_data:
-
-            await update.message.reply_text(
-                "❌ Invalid license key.\n\n"
-                "The key does not exist."
-            )
-
-            return
-
-        if license_data["status"] != "active":
-
-            await update.message.reply_text(
-                "🚫 This license is "
-                f"{license_data['status']}."
-            )
-
-            return
-
-        if is_expired(
-            license_data["expires_at"]
-        ):
-
-            revoke_license(key)
-
-            await update.message.reply_text(
-                "⏳ This license has expired."
-            )
-
-            return
-
-        # Activate RAM session
-        ACTIVE_SESSIONS[
-            user.id
-        ] = key
-
-        # Record activation
-        activate_license(
-            key,
-            user.id
-        )
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
 
         await update.message.reply_text(
-
-            "✅ LICENSE ACTIVATED!\n\n"
-
-            f"🔑 `{key}`\n"
-            f"📌 Status: Active\n"
-            f"⏳ "
-            f"{format_expiry(license_data['expires_at'])}\n"
-            f"🕐 "
-            f"{remaining_time(license_data['expires_at'])}\n\n"
-
-            "♾️ Unlimited downloads\n"
-            "🔄 Bot restart requires activation again.",
-
+            message,
             parse_mode="Markdown",
-
-            reply_markup=main_menu(
-                user.id
+            reply_markup=(
+                main_menu(user.id)
+                if success
+                else cancel_menu()
             )
         )
 
         return
 
-    # ==================================================
-    # GENERATE KEY
-    # ==================================================
 
-    if state == "gen_key":
+    # =====================================================
+    # VIDEO URL
+    # =====================================================
 
-        if not is_owner(user.id):
+    if state == "video_url":
 
-            return
-
-        duration = text.lower().strip()
-
-        allowed = {
-            "1d",
-            "7d",
-            "30d",
-            "90d",
-            "1y",
-            "lifetime",
-        }
-
-        if duration not in allowed:
-
-            await update.message.reply_text(
-                "❌ Invalid duration.\n\n"
-                "Use: 1d, 7d, 30d, 90d, 1y, lifetime"
-            )
-
-            return
-
-        key = generate_key()
-
-        expires_at = calculate_expiry(
-            duration
-        )
-
-        success = create_license(
-            key,
-            expires_at,
+        if not get_session_license(
             user.id
-        )
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
-
-        if not success:
-
-            await update.message.reply_text(
-                "❌ Failed to create license."
-            )
-
-            return
-
-        await update.message.reply_text(
-
-            "✅ LICENSE CREATED\n\n"
-
-            f"🔑 `{key}`\n"
-            f"⏳ {format_expiry(expires_at)}\n"
-            f"📦 Type: `{duration}`\n\n"
-
-            "Copy this key and give it to the user.",
-
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # ==================================================
-    # KEY INFO
-    # ==================================================
-
-    if state == "key_info":
-
-        if not is_owner(user.id):
-
-            return
-
-        key = normalize_license_key(
-            text
-        )
-
-        data = get_license(key)
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
-
-        if not data:
-
-            await update.message.reply_text(
-                "❌ Key not found."
-            )
-
-            return
-
-        await update.message.reply_text(
-
-            "🔍 LICENSE INFO\n\n"
-
-            f"🔑 `{data['license_key']}`\n"
-            f"📌 Status: `{data['status']}`\n"
-            f"📅 Created: `{data['created_at']}`\n"
-            f"⏳ Expires: "
-            f"{format_expiry(data['expires_at'])}\n"
-            f"🆔 Created By: "
-            f"`{data['created_by']}`\n"
-            f"👤 Last Activated By: "
-            f"`{data['last_activated_by']}`",
-
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # ==================================================
-    # REVOKE
-    # ==================================================
-
-    if state == "revoke":
-
-        if not is_main_owner(user.id):
-
-            return
-
-        key = normalize_license_key(
-            text
-        )
-
-        if revoke_license(key):
-
-            # Remove all active sessions
-            for uid in list(
-                ACTIVE_SESSIONS.keys()
-            ):
-
-                if (
-                    ACTIVE_SESSIONS.get(uid)
-                    == key
-                ):
-
-                    ACTIVE_SESSIONS.pop(
-                        uid,
-                        None
-                    )
-
-            await update.message.reply_text(
-                f"🚫 License revoked:\n`{key}`",
-                parse_mode="Markdown"
-            )
-
-        else:
-
-            await update.message.reply_text(
-                "❌ Key not found."
-            )
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
-
-        return
-
-    # ==================================================
-    # RESTORE
-    # ==================================================
-
-    if state == "restore":
-
-        if not is_main_owner(user.id):
-
-            return
-
-        key = normalize_license_key(
-            text
-        )
-
-        if restore_license(key):
-
-            await update.message.reply_text(
-                f"♻️ License restored:\n`{key}`",
-                parse_mode="Markdown"
-            )
-
-        else:
-
-            await update.message.reply_text(
-                "❌ Key not found."
-            )
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
-
-        return
-
-    # ==================================================
-    # DELETE
-    # ==================================================
-
-    if state == "delete":
-
-        if not is_main_owner(user.id):
-
-            return
-
-        key = normalize_license_key(
-            text
-        )
-
-        # Remove active sessions first
-        for uid in list(
-            ACTIVE_SESSIONS.keys()
         ):
-
-            if (
-                ACTIVE_SESSIONS.get(uid)
-                == key
-            ):
-
-                ACTIVE_SESSIONS.pop(
-                    uid,
-                    None
-                )
-
-        if delete_license(key):
-
-            await update.message.reply_text(
-                f"🗑 License deleted:\n`{key}`",
-                parse_mode="Markdown"
-            )
-
-        else:
-
-            await update.message.reply_text(
-                "❌ Key not found."
-            )
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
-
-        return
-
-    # ==================================================
-    # ADD CHANNEL
-    # ==================================================
-
-    if state == "add_channel":
-
-        if not is_owner(user.id):
-
-            return
-
-        channel = text.strip()
-
-        channel = re.sub(
-            r"^https?://t\.me/",
-            "",
-            channel,
-            flags=re.I
-        )
-
-        if not channel.startswith("@"):
-
-            channel = "@" + channel
-
-        if not re.fullmatch(
-            r"@[A-Za-z0-9_]{5,32}",
-            channel
-        ):
-
-            await update.message.reply_text(
-                "❌ Invalid public channel username."
-            )
-
-            return
-
-        success = add_channel(
-            channel,
-            None,
-            user.id
-        )
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
-
-        if success:
-
-            await update.message.reply_text(
-                f"✅ Channel added:\n{channel}\n\n"
-                "Make sure the bot is Administrator "
-                "and can Post Messages."
-            )
-
-        else:
-
-            await update.message.reply_text(
-                "⚠️ This channel already exists."
-            )
-
-        return
-
-    # ==================================================
-    # REMOVE CHANNEL
-    # ==================================================
-
-    if state == "remove_channel":
-
-        if not is_owner(user.id):
-
-            return
-
-        channel = text.strip()
-
-        if not channel.startswith("@"):
-
-            channel = "@" + channel
-
-        success = delete_channel(
-            channel
-        )
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
-
-        if success:
-
-            await update.message.reply_text(
-                f"🗑 Removed:\n{channel}"
-            )
-
-        else:
-
-            await update.message.reply_text(
-                "❌ Channel not found."
-            )
-
-        return
-
-    # ==================================================
-    # SET OWNER
-    # ==================================================
-
-    if state == "set_owner":
-
-        if not is_main_owner(user.id):
-
-            return
-
-        try:
-
-            target_id = int(
-                text
-            )
-
-        except ValueError:
-
-            await update.message.reply_text(
-                "❌ Invalid Telegram ID."
-            )
-
-            return
-
-        set_user_role(
-            target_id,
-            "owner"
-        )
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
-
-        await update.message.reply_text(
-            f"👑 `{target_id}` is now Owner.",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # ==================================================
-    # SET USER
-    # ==================================================
-
-    if state == "set_user":
-
-        if not is_main_owner(user.id):
-
-            return
-
-        try:
-
-            target_id = int(
-                text
-            )
-
-        except ValueError:
-
-            await update.message.reply_text(
-                "❌ Invalid Telegram ID."
-            )
-
-            return
-
-        # Main owner cannot be demoted
-        if target_id == MAIN_OWNER_ID:
-
-            await update.message.reply_text(
-                "❌ Main Owner cannot be changed."
-            )
-
-            return
-
-        set_user_role(
-            target_id,
-            "user"
-        )
-
-        USER_STATES.pop(
-            user.id,
-            None
-        )
-
-        await update.message.reply_text(
-            f"👤 `{target_id}` is now User.",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # ==================================================
-    # VIDEO / MP3 URL
-    # ==================================================
-
-    if state in (
-        "video",
-        "mp3"
-    ):
-
-        license_data = get_session_license(
-            user.id
-        )
-
-        if not license_data:
 
             USER_STATES.pop(
                 user.id,
@@ -1506,213 +1358,183 @@ async def text_handler(
             )
 
             await update.message.reply_text(
-                "🔒 Your license session is "
-                "not active.\n\n"
-                "Please activate your key again."
+                "❌ Active license required.",
+                reply_markup=main_menu(user.id)
             )
 
             return
 
-        url = text.strip()
-
-        if not is_supported_url(url):
+        if not is_supported_url(
+            text
+        ):
 
             await update.message.reply_text(
-
-                "❌ Unsupported URL.\n\n"
-
-                "Supported:\n"
-                "• YouTube\n"
-                "• YouTube Shorts\n"
-                "• TikTok"
+                "❌ Invalid URL.\n\n"
+                "Please send a YouTube or TikTok URL."
             )
 
             return
 
-        mode = state
+        PENDING_URLS[user.id] = text
+
+        try:
+
+            await update.message.reply_text(
+                "🔎 Checking available video qualities..."
+            )
+
+            info = await get_video_info(
+                text
+            )
+
+            available = get_available_qualities(
+                info
+            )
+
+            title = info.get(
+                "title",
+                "Video"
+            )
+
+            await update.message.reply_text(
+                f"🎬 {title}\n\n"
+                "Choose your video quality:",
+                reply_markup=quality_menu_from_available(
+                    available
+                )
+            )
+
+        except Exception as error:
+
+            PENDING_URLS.pop(
+                user.id,
+                None
+            )
+
+            await update.message.reply_text(
+                "❌ Could not read video.\n\n"
+                f"{str(error)[:1200]}",
+                reply_markup=main_menu(user.id)
+            )
+
+        return
+
+
+    # =====================================================
+    # MP3
+    # =====================================================
+
+    if state == "mp3":
+
+        if not get_session_license(
+            user.id
+        ):
+
+            USER_STATES.pop(
+                user.id,
+                None
+            )
+
+            await update.message.reply_text(
+                "❌ Active license required.",
+                reply_markup=main_menu(user.id)
+            )
+
+            return
+
+        if not is_supported_url(
+            text
+        ):
+
+            await update.message.reply_text(
+                "❌ Invalid URL.\n\n"
+                "Please send a YouTube or TikTok URL."
+            )
+
+            return
 
         USER_STATES.pop(
             user.id,
             None
         )
 
-        status_message = await update.message.reply_text(
-            "⏳ Downloading...\n\n"
-            "Please wait."
+        folder = create_temp_dir(
+            str(DOWNLOAD_DIR)
         )
-
-        folder = create_temp_dir()
 
         try:
 
-            if mode == "video":
-
-                file_path = await download_video(
-                    url,
-                    folder
-                )
-
-            else:
-
-                file_path = await download_mp3(
-                    url,
-                    folder
-                )
-
-            if not file_path:
-
-                await status_message.edit_text(
-                    "❌ Could not find downloaded file."
-                )
-
-                return
-
-            if is_file_too_large(
-                file_path
-            ):
-
-                size_mb = (
-                    Path(file_path).stat().st_size
-                    / 1024
-                    / 1024
-                )
-
-                await status_message.edit_text(
-
-                    "❌ File is too large.\n\n"
-
-                    f"📦 Size: {size_mb:.2f} MB\n"
-                    f"🚫 Maximum: "
-                    f"{MAX_FILE_SIZE / 1024 / 1024:.0f} MB"
-                )
-
-                return
-
-            await status_message.edit_text(
-                "📤 Uploading..."
+            await update.message.reply_text(
+                "⏳ Downloading MP3...\n\n"
+                "Please wait."
             )
 
-            filename = Path(
-                file_path
-            ).name
+            file_path = await download_mp3(
+                text,
+                folder,
+                "192"
+            )
 
-            if mode == "video":
+            if is_file_too_large(
+                file_path,
+                MAX_FILE_SIZE
+            ):
 
-                with open(
-                    file_path,
-                    "rb"
-                ) as video:
+                await update.message.reply_text(
+                    "❌ MP3 file is too large."
+                )
 
-                    await update.message.reply_video(
-                        video=video,
-                        caption=(
-                            "🎬 NUTHH’ Downloader"
-                            "\n\n"
-                            f"📁 {filename}"
-                        ),
-                        supports_streaming=True
+                return
+
+            with file_path.open(
+                "rb"
+            ) as audio:
+
+                await update.message.reply_audio(
+                    audio=audio,
+                    caption=(
+                        "🎵 NUTHH’ Downloader\n"
+                        "MP3 192kbps"
                     )
+                )
 
-            else:
+            # ---------------------------------------------
+            # POST MP3 TO ALL CHANNELS
+            # ---------------------------------------------
 
-                with open(
-                    file_path,
-                    "rb"
-                ) as audio:
+            channels = get_channels()
 
-                    await update.message.reply_audio(
-                        audio=audio,
-                        caption=(
-                            "🎵 NUTHH’ MP3"
-                            "\n\n"
-                            f"📁 {filename}"
-                        ),
-                        title=filename
-                    )
+            for channel in channels:
 
-                # --------------------------------
-                # AUTO POST MP3 TO CHANNELS
-                # --------------------------------
+                try:
 
-                channels = get_channels()
+                    with file_path.open(
+                        "rb"
+                    ) as audio:
 
-                success_count = 0
-                failed_count = 0
-
-                for channel in channels:
-
-                    try:
-
-                        with open(
-                            file_path,
-                            "rb"
-                        ) as audio:
-
-                            await context.bot.send_audio(
-
-                                chat_id=channel[
-                                    "username"
-                                ],
-
-                                audio=audio,
-
-                                caption=(
-                                    "🎵 NUTHH’ Music"
-                                    "\n\n"
-                                    f"📁 {filename}"
-                                )
+                        await context.bot.send_audio(
+                            chat_id=channel["username"],
+                            audio=audio,
+                            caption=(
+                                "🎵 NUTHH’ Downloader\n"
+                                "MP3 192kbps"
                             )
-
-                        success_count += 1
-
-                    except Exception as channel_error:
-
-                        failed_count += 1
-
-                        print(
-                            "Channel error:",
-                            channel_error
                         )
 
-                if channels:
+                except Exception as error:
 
-                    await update.message.reply_text(
-
-                        "📢 Channel Distribution\n\n"
-
-                        f"✅ Success: "
-                        f"{success_count}\n"
-
-                        f"❌ Failed: "
-                        f"{failed_count}"
+                    print(
+                        f"Channel "
+                        f"{channel['username']} "
+                        f"failed: {error}"
                     )
-
-            await status_message.delete()
 
         except Exception as error:
 
-            print(
-                "DOWNLOAD ERROR:",
-                repr(error)
+            await update.message.reply_text(
+                "❌ MP3 download failed.\n\n"
+                f"{str(error)[:1500]}"
             )
-
-            try:
-
-                await status_message.edit_text(
-
-                    "❌ Download failed.\n\n"
-
-                    "Possible reasons:\n"
-                    "• URL is unavailable\n"
-                    "• Video is private\n"
-                    "• Platform changed\n"
-                    "• File cannot be downloaded\n\n"
-
-                    "Please try another URL."
-                )
-
-            except Exception:
-                pass
 
         finally:
 
@@ -1722,158 +1544,370 @@ async def text_handler(
 
         return
 
-    # ==================================================
-    # UNKNOWN TEXT
-    # ==================================================
+
+    # =====================================================
+    # KEY INFO / REVOKE / RESTORE / DELETE
+    # =====================================================
+
+    if state in (
+        "keyinfo",
+        "revoke",
+        "restore",
+        "delete",
+    ):
+
+        key = normalize_license_key(
+            text
+        )
+
+        row = get_license(
+            key
+        )
+
+        if not row:
+
+            await update.message.reply_text(
+                "❌ License key not found."
+            )
+
+            return
+
+
+        # ---------------------------------------------
+        # KEY INFO
+        # ---------------------------------------------
+
+        if state == "keyinfo":
+
+            message = (
+                "🔍 LICENSE INFO\n\n"
+
+                f"🔑 `{row['license_key']}`\n\n"
+
+                f"📌 Status: "
+                f"{row['status']}\n"
+
+                f"⏳ Remaining: "
+                f"{remaining_time(row['expires_at'])}\n"
+
+                f"📅 Expires: "
+                f"{format_expiry(row['expires_at'])}"
+            )
+
+            await update.message.reply_text(
+                message,
+                parse_mode="Markdown",
+                reply_markup=owner_menu()
+            )
+
+
+        # ---------------------------------------------
+        # REVOKE
+        # ---------------------------------------------
+
+        elif state == "revoke":
+
+            if not is_main_owner(
+                user.id
+            ):
+
+                await update.message.reply_text(
+                    "❌ Main Owner only."
+                )
+
+                return
+
+            revoke_license(
+                key
+            )
+
+            # Remove active sessions
+            for uid, active_key in list(
+                ACTIVE_SESSIONS.items()
+            ):
+
+                if normalize_license_key(
+                    active_key
+                ) == key:
+
+                    ACTIVE_SESSIONS.pop(
+                        uid,
+                        None
+                    )
+
+            await update.message.reply_text(
+                "✅ License revoked.",
+                reply_markup=owner_menu()
+            )
+
+
+        # ---------------------------------------------
+        # RESTORE
+        # ---------------------------------------------
+
+        elif state == "restore":
+
+            if not is_main_owner(
+                user.id
+            ):
+
+                await update.message.reply_text(
+                    "❌ Main Owner only."
+                )
+
+                return
+
+            restore_license(
+                key
+            )
+
+            await update.message.reply_text(
+                "✅ License restored.",
+                reply_markup=owner_menu()
+            )
+
+
+        # ---------------------------------------------
+        # DELETE
+        # ---------------------------------------------
+
+        elif state == "delete":
+
+            if not is_main_owner(
+                user.id
+            ):
+
+                await update.message.reply_text(
+                    "❌ Main Owner only."
+                )
+
+                return
+
+            for uid, active_key in list(
+                ACTIVE_SESSIONS.items()
+            ):
+
+                if normalize_license_key(
+                    active_key
+                ) == key:
+
+                    ACTIVE_SESSIONS.pop(
+                        uid,
+                        None
+                    )
+
+            delete_license(
+                key
+            )
+
+            await update.message.reply_text(
+                "✅ License deleted.",
+                reply_markup=owner_menu()
+            )
+
+        USER_STATES.pop(
+            user.id,
+            None
+        )
+
+        return
+
+
+    # =====================================================
+    # ADD CHANNEL
+    # =====================================================
+
+    if state == "addchannel":
+
+        if not is_owner(
+            user.id
+        ):
+
+            await update.message.reply_text(
+                "❌ Owner only."
+            )
+
+            return
+
+        channel = text.strip()
+
+        if not re.fullmatch(
+            r"@[A-Za-z0-9_]{5,}",
+            channel
+        ):
+
+            await update.message.reply_text(
+                "❌ Invalid channel username.\n\n"
+                "Example:\n"
+                "@music_khmer"
+            )
+
+            return
+
+        try:
+
+            add_channel(
+                channel,
+                channel,
+                user.id
+            )
+
+            USER_STATES.pop(
+                user.id,
+                None
+            )
+
+            await update.message.reply_text(
+                f"✅ Channel added:\n"
+                f"{channel}\n\n"
+                "Make sure the bot is Administrator "
+                "and has permission to post messages.",
+                reply_markup=owner_menu()
+            )
+
+        except Exception as error:
+
+            await update.message.reply_text(
+                f"❌ Could not add channel:\n"
+                f"{str(error)}"
+            )
+
+        return
+
+
+    # =====================================================
+    # REMOVE CHANNEL
+    # =====================================================
+
+    if state == "removechannel":
+
+        if not is_owner(
+            user.id
+        ):
+
+            await update.message.reply_text(
+                "❌ Owner only."
+            )
+
+            return
+
+        delete_channel(
+            text.strip()
+        )
+
+        USER_STATES.pop(
+            user.id,
+            None
+        )
+
+        await update.message.reply_text(
+            "✅ Channel removed.",
+            reply_markup=owner_menu()
+        )
+
+        return
+
+
+    # =====================================================
+    # SET OWNER / USER
+    # =====================================================
+
+    if state in (
+        "setowner",
+        "setuser",
+    ):
+
+        if not is_main_owner(
+            user.id
+        ):
+
+            await update.message.reply_text(
+                "❌ Main Owner only."
+            )
+
+            return
+
+        try:
+
+            target_id = int(
+                text.strip()
+            )
+
+        except ValueError:
+
+            await update.message.reply_text(
+                "❌ Invalid Telegram User ID."
+            )
+
+            return
+
+
+        if (
+            state == "setuser"
+            and target_id == MAIN_OWNER_ID
+        ):
+
+            await update.message.reply_text(
+                "❌ Main Owner cannot be demoted."
+            )
+
+            return
+
+
+        role = (
+            "owner"
+            if state == "setowner"
+            else "user"
+        )
+
+        set_user_role(
+            target_id,
+            role
+        )
+
+        USER_STATES.pop(
+            user.id,
+            None
+        )
+
+        await update.message.reply_text(
+            f"✅ User `{target_id}` "
+            f"is now `{role}`.",
+            parse_mode="Markdown",
+            reply_markup=owner_menu()
+        )
+
+        return
+
+
+    # =====================================================
+    # FALLBACK
+    # =====================================================
 
     await update.message.reply_text(
         "Please use the buttons below.",
-        reply_markup=main_menu(
-            user.id
-        )
+        reply_markup=main_menu(user.id)
     )
 
 
-# ==================================================
-# COMMAND: /id
-# ==================================================
-
-async def my_id_command(
-    update,
-    context
-):
-
-    await update.message.reply_text(
-        f"🆔 Your Telegram ID:\n\n"
-        f"`{update.effective_user.id}`",
-        parse_mode="Markdown"
-    )
-
-
-# ==================================================
-# COMMAND: /panel
-# ==================================================
-
-async def panel_command(
-    update,
-    context
-):
-
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-
-        await update.message.reply_text(
-            "❌ Owner access required."
-        )
-
-        return
-
-    await update.message.reply_text(
-        "👑 Owner Panel",
-        reply_markup=owner_menu()
-    )
-
-
-# ==================================================
-# COMMAND: /genkey
-# ==================================================
-
-async def genkey_command(
-    update,
-    context
-):
-
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-
-        await update.message.reply_text(
-            "❌ Owner access required."
-        )
-
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-
-            "Usage:\n\n"
-
-            "/genkey 1d\n"
-            "/genkey 7d\n"
-            "/genkey 30d\n"
-            "/genkey 90d\n"
-            "/genkey 1y\n"
-            "/genkey lifetime"
-        )
-
-        return
-
-    duration = (
-        context.args[0]
-        .lower()
-        .strip()
-    )
-
-    allowed = {
-        "1d",
-        "7d",
-        "30d",
-        "90d",
-        "1y",
-        "lifetime"
-    }
-
-    if duration not in allowed:
-
-        await update.message.reply_text(
-            "❌ Invalid duration."
-        )
-
-        return
-
-    key = generate_key()
-
-    expires_at = calculate_expiry(
-        duration
-    )
-
-    create_license(
-        key,
-        expires_at,
-        user_id
-    )
-
-    await update.message.reply_text(
-
-        "✅ License Generated\n\n"
-
-        f"🔑 `{key}`\n"
-        f"⏳ {format_expiry(expires_at)}",
-
-        parse_mode="Markdown"
-    )
-
-
-# ==================================================
+# =========================================================
 # ERROR HANDLER
-# ==================================================
+# =========================================================
 
 async def error_handler(
-    update,
-    context
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     print(
         "BOT ERROR:",
-        repr(context.error)
+        context.error
     )
 
 
-# ==================================================
+# =========================================================
 # MAIN
-# ==================================================
+# =========================================================
 
 def main():
 
@@ -1881,48 +1915,37 @@ def main():
 
     init_db()
 
-    app = (
+    application = (
         Application
         .builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    app.add_handler(
+    # Commands
+    application.add_handler(
         CommandHandler(
             "start",
             start
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
-            "id",
-            my_id_command
+            "activate",
+            activate_command
         )
     )
 
-    app.add_handler(
-        CommandHandler(
-            "panel",
-            panel_command
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "genkey",
-            genkey_command
-        )
-    )
-
-    app.add_handler(
+    # Buttons
+    application.add_handler(
         CallbackQueryHandler(
             callback_handler
         )
     )
 
-    app.add_handler(
+    # Text
+    application.add_handler(
         MessageHandler(
             filters.TEXT
             & ~filters.COMMAND,
@@ -1930,18 +1953,40 @@ def main():
         )
     )
 
-    app.add_error_handler(
+    # Errors
+    application.add_error_handler(
         error_handler
+    )
+
+    print(
+        "========================================"
     )
 
     print(
         "NUTHH’ Downloader is running..."
     )
 
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    print(
+        "4K / 2K / 1080p / 720p enabled"
     )
 
+    print(
+        "Owner:",
+        MAIN_OWNER_ID
+    )
+
+    print(
+        "========================================"
+    )
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     main()
